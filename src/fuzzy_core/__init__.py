@@ -13,6 +13,15 @@ from .fuzzy_variable import (
     get_distance_function,
     hausdorff_distance,
 )
+from .generator import (
+    DEFAULT_A_RANGE,
+    DEFAULT_COUNT_RANGE,
+    DEFAULT_WIDTH_RANGE,
+    MAX_COUNT,
+    MIN_COUNT,
+    generate_sample,
+    generate_variables,
+)
 
 __all__ = [
     "UniformFuzzyVariable",
@@ -23,5 +32,12 @@ __all__ = [
     "hausdorff_distance",
     "DISTANCE_METRICS",
     "get_distance_function",
+    "generate_sample",
+    "generate_variables",
+    "MIN_COUNT",
+    "MAX_COUNT",
+    "DEFAULT_COUNT_RANGE",
+    "DEFAULT_A_RANGE",
+    "DEFAULT_WIDTH_RANGE",
 ]
 __version__ = "0.1.0"
