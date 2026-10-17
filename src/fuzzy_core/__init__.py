@@ -4,6 +4,16 @@
 использоваться сторонними программами как обычная библиотека.
 """
 
+from .clustering import (
+    CLUSTERING_METHODS,
+    NOISE_LABEL,
+    Cluster,
+    ClusterResult,
+    cluster,
+    density_clustering,
+    kmeans,
+    threshold_clustering,
+)
 from .fuzzy_set import FuzzySet, FuzzySetError
 from .fuzzy_variable import (
     DISTANCE_METRICS,
@@ -34,6 +44,14 @@ __all__ = [
     "get_distance_function",
     "generate_sample",
     "generate_variables",
+    "kmeans",
+    "threshold_clustering",
+    "density_clustering",
+    "cluster",
+    "Cluster",
+    "ClusterResult",
+    "CLUSTERING_METHODS",
+    "NOISE_LABEL",
     "MIN_COUNT",
     "MAX_COUNT",
     "DEFAULT_COUNT_RANGE",
