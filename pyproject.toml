@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "non-classical-logics"
+version = "0.1.0"
+description = "Моделирование нечетких величин равномерного типа и кластерный анализ (вариант 1)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.1",
+    "matplotlib>=3.9.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3"]
+docs = ["python-docx>=1.1.2", "pypdf>=5.0"]
+
+# src-layout: пакеты лежат в src/ (fuzzy_core, gui, logger) и могут быть
+# установлены как независимая библиотека сторонними программами.
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
