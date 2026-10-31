@@ -1,11 +1,14 @@
 """Кластерный анализ множества нечетких величин.
 
-Реализованы три метода:
+Реализованы четыре метода:
 
 * ``kmeans`` — кластер-анализ на заданное число кластеров K (K-Means,
   адаптированный под интервальные величины: центроид — среднее границ);
 * ``threshold`` — кластеризация по порогу внутрикластерного расстояния
   (агломеративная, критерий полной связи / complete-linkage);
+* ``alpha`` — кластеризация по α-уровню: α-срез отношения сходства между
+  величинами (уровень — безразмерная величина из ``(0, 1]``, она же
+  «уровень отбора», от которого зависит число кластеров);
 * ``density`` — кластеризация по плотности (DBSCAN-подобная: ``eps`` и ``min_points``).
 
 Расстояние между величинами задаётся метрикой из :mod:`fuzzy_core.fuzzy_variable`
@@ -16,19 +19,30 @@
 
 from __future__ import annotations
 
+import bisect
 import heapq
+import math
 import random
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .fuzzy_variable import UniformFuzzyVariable, get_distance_function
+
+try:  # numpy ускоряет транзитивное замыкание; без него работает чистый Python
+    import numpy as _np
+except ImportError:  # pragma: no cover - окружение без numpy
+    _np = None
 
 __all__ = [
     "Cluster",
     "ClusterResult",
     "kmeans",
     "threshold_clustering",
+    "alpha_cut_clustering",
+    "alpha_cut_profile",
+    "similarity_matrix",
+    "max_min_closure",
     "density_clustering",
     "cluster",
     "CLUSTERING_METHODS",
@@ -404,6 +418,55 @@ def kmeans(
 # ----------------------------------------------------------------------
 # Кластеризация по порогу (полная связь)
 # ----------------------------------------------------------------------
+def _agglomerate(
+    items: Sequence[UniformFuzzyVariable],
+    distance: Callable[[Any, Any], float],
+    threshold: Optional[float] = None,
+) -> Tuple[List[List[int]], List[float]]:
+    """Агломеративная кластеризация с критерием полной связи.
+
+    Возвращает ``(группы индексов, высоты слияний)``. Если ``threshold``
+    задан, слияния выше порога не выполняются; если ``None`` — выполняется
+    весь процесс, а высоты собираются целиком (нужно для профиля α-уровней).
+    """
+    size = len(items)
+    matrix = _distance_matrix(items, distance)
+    clusters: Dict[int, List[int]] = {i: [i] for i in range(size)}
+    pair_distance: Dict[Tuple[int, int], float] = {}
+    heap: List[Tuple[float, int, int]] = []
+    heights: List[float] = []
+
+    for i in range(size):
+        for j in range(i + 1, size):
+            pair_distance[(i, j)] = matrix[i][j]
+            heap.append((matrix[i][j], i, j))
+    heapq.heapify(heap)
+
+    while heap:
+        value, first, second = heapq.heappop(heap)
+        if first not in clusters or second not in clusters:
+            continue
+        if pair_distance.get((first, second)) != value:
+            continue  # устаревшая запись
+        if threshold is not None and value > threshold:
+            break  # минимальное расстояние по полной связи превысило порог
+
+        heights.append(value)
+        merged = clusters[first] + clusters[second]
+        del clusters[second]
+        clusters[first] = merged
+
+        for other in list(clusters):
+            if other == first:
+                continue
+            new_value = max(matrix[x][y] for x in clusters[first] for y in clusters[other])
+            key = (first, other) if first < other else (other, first)
+            pair_distance[key] = new_value
+            heapq.heappush(heap, (new_value, key[0], key[1]))
+
+    return list(clusters.values()), heights
+
+
 def threshold_clustering(
     variables: Iterable[object],
     *,
@@ -419,51 +482,15 @@ def threshold_clustering(
     весь набор в один кластер.
     """
     items = _as_items(variables)
-    size = len(items)
     if threshold < 0:
         raise ValueError(f"threshold не может быть отрицательным, получено {threshold!r}")
 
-    distance = get_distance_function(metric)
     parameters = {"threshold": threshold}
-
-    if size == 0:
+    if not items:
         return _build_result(items, [], "threshold", metric, parameters)
 
-    matrix = _distance_matrix(items, distance)
-    clusters: Dict[int, List[int]] = {i: [i] for i in range(size)}
-    pair_distance: Dict[Tuple[int, int], float] = {}
-    heap: List[Tuple[float, int, int]] = []
-
-    for i in range(size):
-        for j in range(i + 1, size):
-            pair_distance[(i, j)] = matrix[i][j]
-            heap.append((matrix[i][j], i, j))
-    heapq.heapify(heap)
-
-    while heap:
-        value, first, second = heapq.heappop(heap)
-        if first not in clusters or second not in clusters:
-            continue
-        if pair_distance.get((first, second)) != value:
-            continue  # устаревшая запись
-        if value > threshold:
-            break  # минимальное расстояние по полной связи превысило порог
-
-        merged = clusters[first] + clusters[second]
-        del clusters[second]
-        clusters[first] = merged
-
-        for other in list(clusters):
-            if other == first:
-                continue
-            new_value = max(matrix[x][y] for x in clusters[first] for y in clusters[other])
-            key = (first, other) if first < other else (other, first)
-            pair_distance[key] = new_value
-            heapq.heappush(heap, (new_value, key[0], key[1]))
-
-    return _build_result(
-        items, list(clusters.values()), "threshold", metric, parameters
-    )
+    groups, _ = _agglomerate(items, get_distance_function(metric), threshold)
+    return _build_result(items, groups, "threshold", metric, parameters)
 
 
 # ----------------------------------------------------------------------
@@ -526,11 +553,246 @@ def density_clustering(
 
 
 # ----------------------------------------------------------------------
+# Кластеризация по α-уровню (α-срезы отношения сходства)
+# ----------------------------------------------------------------------
+def _validate_alpha(alpha: float) -> float:
+    """Проверить α-уровень: конечное число из интервала ``(0, 1]``."""
+    value = float(alpha)
+    if not math.isfinite(value):
+        raise ValueError(f"α-уровень должен быть конечным числом, получено {alpha!r}")
+    if not 0.0 < value <= 1.0:
+        raise ValueError(f"α-уровень должен лежать в (0, 1], получено {alpha!r}")
+    return value
+
+
+def _similarity_data(
+    items: Sequence[UniformFuzzyVariable],
+    distance: Callable[[Any, Any], float],
+    scale: Optional[float],
+) -> Tuple[List[List[float]], float]:
+    """Матрица сходства ``r_ij = 1 - d_ij / d0`` и использованный масштаб ``d0``."""
+    size = len(items)
+    if size == 0:
+        return [], 0.0
+    distances = _distance_matrix(items, distance)
+    if scale is None:
+        d0 = max((max(row) for row in distances), default=0.0)
+    else:
+        d0 = float(scale)
+        if not math.isfinite(d0) or d0 <= 0.0:
+            raise ValueError(
+                "масштаб расстояний должен быть положительным числом, "
+                f"получено {scale!r}"
+            )
+    if d0 <= 0.0:
+        # Все величины совпадают: сходство максимально на всех парах.
+        return [[1.0] * size for _ in range(size)], 0.0
+    matrix = [
+        [1.0 - distances[i][j] / d0 for j in range(size)] for i in range(size)
+    ]
+    for i in range(size):
+        matrix[i][i] = 1.0
+    return matrix, d0
+
+
+def similarity_matrix(
+    variables: Iterable[object],
+    *,
+    metric: str = "hausdorff",
+    scale: Optional[float] = None,
+) -> List[List[float]]:
+    """Матрица сходства величин со значениями из ``[0, 1]``.
+
+    ``r_ij = 1 - d_ij / d0``, где ``d0`` — аргумент ``scale`` либо (по
+    умолчанию) максимальное расстояние в выборке. ``r_ii = 1``, матрица
+    симметрична.
+    """
+    items = _as_items(variables)
+    matrix, _ = _similarity_data(items, get_distance_function(metric), scale)
+    return matrix
+
+
+def max_min_closure(similarity: Sequence[Sequence[float]]) -> List[List[float]]:
+    """Max-min транзитивное замыкание отношения сходства.
+
+    Результат — нечеткое отношение эквивалентности (рефлексивное,
+    симметричное, транзитивное, ``R* >= R``). Его α-срезы задают вложенную
+    иерархию разбиений (декомпозиция Заде).
+    """
+    size = len(similarity)
+    if size == 0:
+        return []
+    if _np is not None:
+        matrix = _np.array(similarity, dtype=float)
+        for k in range(size):
+            column = matrix[:, [k]]
+            row = matrix[[k], :]
+            matrix = _np.maximum(matrix, _np.minimum(column, row))
+        return matrix.tolist()
+    result = [list(map(float, row)) for row in similarity]
+    for k in range(size):
+        row_k = result[k]
+        for i in range(size):
+            row_i = result[i]
+            value = row_i[k]
+            if value <= 0.0:
+                continue
+            for j in range(size):
+                candidate = value if value < row_k[j] else row_k[j]
+                if candidate > row_i[j]:
+                    row_i[j] = candidate
+    return result
+
+
+def _alpha_components(
+    matrix: Sequence[Sequence[float]], alpha: float
+) -> List[List[int]]:
+    """Компоненты связности графа ``r_ij >= alpha`` — кластеры α-среза."""
+    size = len(matrix)
+    parent = list(range(size))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for i in range(size):
+        row = matrix[i]
+        for j in range(i + 1, size):
+            if row[j] >= alpha:
+                root_i, root_j = find(i), find(j)
+                if root_i != root_j:
+                    parent[root_j] = root_i
+
+    groups: Dict[int, List[int]] = {}
+    for index in range(size):
+        groups.setdefault(find(index), []).append(index)
+    return list(groups.values())
+
+
+def alpha_cut_clustering(
+    variables: Iterable[object],
+    *,
+    alpha: float = 0.5,
+    metric: str = "hausdorff",
+    linkage: str = "single",
+    closure: bool = True,
+    scale: Optional[float] = None,
+) -> ClusterResult:
+    """Кластеризация по α-уровню отношения сходства.
+
+    ``alpha`` — уровень отбора из ``(0, 1]`` по шкале сходства
+    ``r_ij = 1 - d_ij / d0``. Чем уровень выше, тем строже критерий и тем
+    больше кластеров; при ``alpha = 1`` в кластер попадают только полностью
+    совпадающие величины, при малом ``alpha`` всё сливается в один кластер.
+
+    ``linkage`` задаёт, как читать уровень:
+
+    * ``"single"`` (по умолчанию) — канонический α-срез отношения сходства:
+      кластеры — компоненты связности графа ``r_ij >= alpha``. При
+      ``closure=True`` сходство предварительно замыкается до нечеткого
+      отношения эквивалентности (декомпозиция Заде);
+    * ``"complete"`` — разрез дендрограммы полной связи по уровню ``alpha``:
+      в один кластер попадают величины, у которых *все* пары имеют сходство
+      не ниже уровня. Уровень строже, поэтому число кластеров убывает
+      плавнее и результат нагляднее на плотных выборках.
+    """
+    level = _validate_alpha(alpha)
+    key = str(linkage).strip().lower()
+    if key not in {"single", "complete"}:
+        raise ValueError(
+            f"Неизвестный тип связи {linkage!r}. Доступны: single, complete"
+        )
+    items = _as_items(variables)
+    parameters: Dict[str, Any] = {
+        "alpha": level,
+        "linkage": key,
+        "closure": bool(closure) and key == "single",
+    }
+    if not items:
+        return _build_result(items, [], "alpha", metric, parameters)
+
+    matrix, d0 = _similarity_data(items, get_distance_function(metric), scale)
+    parameters["distance_scale"] = d0
+
+    if key == "complete":
+        # Сходство >= alpha  <=>  расстояние <= (1 - alpha) * d0.
+        result = threshold_clustering(
+            items, threshold=(1.0 - level) * d0, metric=metric
+        )
+        return replace(result, method="alpha", parameters=parameters)
+
+    if closure:
+        matrix = max_min_closure(matrix)
+    groups = _alpha_components(matrix, level)
+    return _build_result(items, groups, "alpha", metric, parameters)
+
+
+DEFAULT_ALPHA_GRID: Tuple[float, ...] = (
+    1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1,
+)
+
+
+def alpha_cut_profile(
+    variables: Iterable[object],
+    alphas: Optional[Iterable[float]] = None,
+    *,
+    metric: str = "hausdorff",
+    linkage: str = "single",
+    closure: bool = True,
+    scale: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """Зависимость числа кластеров от α-уровня.
+
+    Возвращает список словарей ``{"alpha": уровень, "cluster_count": k}``.
+    По умолчанию перебираются уровни :data:`DEFAULT_ALPHA_GRID`; ``linkage``
+    понимается так же, как в :func:`alpha_cut_clustering`.
+    """
+    key = str(linkage).strip().lower()
+    if key not in {"single", "complete"}:
+        raise ValueError(
+            f"Неизвестный тип связи {linkage!r}. Доступны: single, complete"
+        )
+    items = _as_items(variables)
+    levels = [
+        _validate_alpha(level)
+        for level in (alphas if alphas is not None else DEFAULT_ALPHA_GRID)
+    ]
+    if not items:
+        return [{"alpha": level, "cluster_count": 0} for level in levels]
+
+    distance = get_distance_function(metric)
+    matrix, d0 = _similarity_data(items, distance, scale)
+
+    if key == "complete":
+        # Дендрограмма строится один раз, уровни — просто разрезы по высоте.
+        _, heights = _agglomerate(items, distance, None)
+        ordered = sorted(heights)
+        return [
+            {
+                "alpha": level,
+                "cluster_count": len(items)
+                - bisect.bisect_right(ordered, (1.0 - level) * d0),
+            }
+            for level in levels
+        ]
+
+    if closure:
+        matrix = max_min_closure(matrix)
+    return [
+        {"alpha": level, "cluster_count": len(_alpha_components(matrix, level))}
+        for level in levels
+    ]
+
+
+# ----------------------------------------------------------------------
 # Единая точка входа
 # ----------------------------------------------------------------------
 CLUSTERING_METHODS: Dict[str, Callable[..., ClusterResult]] = {
     "kmeans": kmeans,
     "threshold": threshold_clustering,
+    "alpha": alpha_cut_clustering,
     "density": density_clustering,
 }
 
@@ -544,9 +806,9 @@ def cluster(
 ) -> ClusterResult:
     """Выполнить кластеризацию выбранным методом.
 
-    ``method`` — одно из ``kmeans``, ``threshold``, ``density``; остальные
-    именованные аргументы передаются выбранному методу (например ``k=5``
-    или ``threshold=0.5``).
+    ``method`` — одно из ``kmeans``, ``threshold``, ``alpha``, ``density``;
+    остальные именованные аргументы передаются выбранному методу (например
+    ``k=5``, ``threshold=0.5`` или ``alpha=0.6``).
     """
     key = str(method).strip().lower()
     if key not in CLUSTERING_METHODS:

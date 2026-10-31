@@ -25,6 +25,7 @@ from fuzzy_core import (
     ClusterResult,
     FuzzySet,
     UniformFuzzyVariable,
+    alpha_cut_profile,
     cluster,
     generate_sample,
     get_distance_function,
@@ -78,7 +79,8 @@ TAB_DESCRIPTIONS: Dict[str, str] = {
     ),
     TAB_CLUSTERING: (
         "Кластерный анализ множества величин: на заданное число кластеров, по порогу "
-        "внутрикластерного расстояния или по плотности; таблица результатов и диаграмма."
+        "внутрикластерного расстояния, по α-уровню или по плотности; таблица результатов "
+        "и диаграмма."
     ),
     TAB_LOG: (
         "Журнал текущей сессии с метками времени: просмотр и сохранение в отдельный файл."
@@ -88,7 +90,9 @@ TAB_DESCRIPTIONS: Dict[str, str] = {
 TAB_HINTS: Dict[str, Sequence[str]] = {
     TAB_ARITHMETIC: ("Операции: сложение, вычитание, умножение, деление, сравнение",),
     TAB_GENERATION: ("Параметры: a ~ U(-10, 10), w ~ U(0, 4), объём 100…300, seed",),
-    TAB_CLUSTERING: ("Методы: K-Means, пороговый (полная связь), плотностной (DBSCAN)",),
+    TAB_CLUSTERING: (
+        "Методы: K-Means, пороговый (полная связь), по α-уровню, плотностной (DBSCAN)",
+    ),
     TAB_LOG: ("Все действия записываются в файл logs/session_<дата>_<время>.log",),
 }
 
@@ -831,12 +835,20 @@ class GenerationTab(ttk.Frame):
 # ----------------------------------------------------------------------
 METHOD_KMEANS = "kmeans"
 METHOD_THRESHOLD = "threshold"
+METHOD_ALPHA = "alpha"
 METHOD_DENSITY = "density"
 
 METHOD_LABELS: Dict[str, str] = {
     METHOD_KMEANS: "K-Means: на K кластеров",
     METHOD_THRESHOLD: "По порогу (полная связь)",
+    METHOD_ALPHA: "По α-уровню (уровень отбора)",
     METHOD_DENSITY: "По плотности (DBSCAN-подобный)",
+}
+
+#: Как читать α-уровень: подписи в интерфейсе и ключи для библиотеки.
+LINKAGE_LABELS: Dict[str, str] = {
+    "complete": "полная",
+    "single": "одиночная",
 }
 
 CLUSTER_COLUMNS: Sequence[Tuple[str, str, int]] = (
@@ -864,10 +876,11 @@ MAX_SIZES_IN_SUMMARY = 12
 class ClusteringTab(ttk.Frame):
     """Кластерный анализ сгенерированной выборки.
 
-    Доступны три метода: K-Means на заданное число кластеров, агломеративный
-    по порогу внутрикластерного расстояния (полная связь) и плотностной
-    (DBSCAN-подобный). Результаты показываются таблицами по кластерам и по
-    точкам, а также диаграммой рассеяния в координатах (центр c, ширина w).
+    Доступны четыре метода: K-Means на заданное число кластеров, агломеративный
+    по порогу внутрикластерного расстояния (полная связь), по α-уровню
+    (уровень отбора по шкале сходства) и плотностной (DBSCAN-подобный).
+    Результаты показываются таблицами по кластерам и по точкам, а также
+    диаграммой рассеяния в координатах (центр c, ширина w).
     """
 
     def __init__(
@@ -886,6 +899,7 @@ class ClusteringTab(ttk.Frame):
         self.on_message: Callable[[str], None] = on_message or (lambda text: None)
         self.on_result: Callable[[object], None] = on_result or (lambda result: None)
         self.result: Optional[ClusterResult] = None
+        self.profile: List[Dict[str, object]] = []
 
         self.rowconfigure(1, weight=1)
         self.columnconfigure(1, weight=1)
@@ -916,7 +930,9 @@ class ClusteringTab(ttk.Frame):
         method.pack(fill="x", pady=(8, 0))
         self.method_var = tk.StringVar(value=METHOD_KMEANS)
         self.method_buttons: Dict[str, ttk.Radiobutton] = {}
-        for row, key in enumerate((METHOD_KMEANS, METHOD_THRESHOLD, METHOD_DENSITY)):
+        for row, key in enumerate(
+            (METHOD_KMEANS, METHOD_THRESHOLD, METHOD_ALPHA, METHOD_DENSITY)
+        ):
             button = ttk.Radiobutton(
                 method,
                 text=METHOD_LABELS[key],
@@ -954,9 +970,31 @@ class ClusteringTab(ttk.Frame):
             (self.k_entry, self.threshold_entry, self.eps_entry, self.min_points_entry)
         ):
             entry.grid(row=row, column=0, sticky="w", pady=1)
+
+        # α-уровень и способ его чтения — в одной строке, чтобы столбец не рос.
+        alpha_row = ttk.Frame(parameters)
+        alpha_row.grid(row=2, column=0, sticky="w", pady=1)
+        self.alpha_entry = LabeledEntry(alpha_row, "α", value="0.7", width=6)
+        self.alpha_entry.pack(side="left")
+        self.linkage_label = ttk.Label(alpha_row, text="связь", font=TEXT_FONT)
+        self.linkage_label.pack(side="left", padx=(8, 4))
+        self.linkage_var = tk.StringVar(value=LINKAGE_LABELS["complete"])
+        self.linkage_box = ttk.Combobox(
+            alpha_row,
+            textvariable=self.linkage_var,
+            values=list(LINKAGE_LABELS.values()),
+            state="readonly",
+            width=11,
+        )
+        self.linkage_box.pack(side="left")
+        # α-строка должна стоять между «порогом» и «eps»: переставляем eps/minPts.
+        self.eps_entry.grid_configure(row=3)
+        self.min_points_entry.grid_configure(row=4)
+
         self.parameter_entries = {
             METHOD_KMEANS: (self.k_entry,),
             METHOD_THRESHOLD: (self.threshold_entry,),
+            METHOD_ALPHA: (self.alpha_entry,),
             METHOD_DENSITY: (self.eps_entry, self.min_points_entry),
         }
 
@@ -1100,14 +1138,17 @@ class ClusteringTab(ttk.Frame):
 
     def _update_parameter_state(self, event: object = None) -> None:
         """Включить поля, относящиеся к выбранному методу."""
-        active = set(self.parameter_entries[self.method_var.get()])
+        method = self.method_var.get()
+        active = set(self.parameter_entries[method])
         for entries in self.parameter_entries.values():
             for entry in entries:
                 state = "normal" if entry in active else "disabled"
                 entry.entry.configure(state=state)
         self.seed_entry.entry.configure(
-            state="normal" if self.method_var.get() == METHOD_KMEANS else "disabled"
+            state="normal" if method == METHOD_KMEANS else "disabled"
         )
+        is_alpha = method == METHOD_ALPHA
+        self.linkage_box.configure(state="readonly" if is_alpha else "disabled")
 
     # ------------------------------------------------------------------
     # Запуск анализа
@@ -1122,6 +1163,8 @@ class ClusteringTab(ttk.Frame):
             return {"k": int(k), "seed": self.read_seed()}
         if key == METHOD_THRESHOLD:
             return {"threshold": self.threshold_entry.number()}
+        if key == METHOD_ALPHA:
+            return {"alpha": self.alpha_entry.number(), "linkage": self.read_linkage()}
         if key == METHOD_DENSITY:
             min_points = self.min_points_entry.number()
             if not float(min_points).is_integer():
@@ -1130,6 +1173,14 @@ class ClusteringTab(ttk.Frame):
                 )
             return {"eps": self.eps_entry.number(), "min_points": int(min_points)}
         raise ValueError(f"неизвестный метод кластеризации: {key!r}")
+
+    def read_linkage(self) -> str:
+        """Тип связи для α-уровня: ``complete`` или ``single``."""
+        label = self.linkage_var.get()
+        for key, text in LINKAGE_LABELS.items():
+            if text == label:
+                return key
+        return "complete"
 
     def read_seed(self) -> object:
         """Зерно генератора: пустое поле → случайное зерно."""
@@ -1164,6 +1215,16 @@ class ClusteringTab(ttk.Frame):
         self.result = result
         self.fill_tables()
         self.show_plot()
+        self.profile = []
+        if method == METHOD_ALPHA:
+            try:
+                self.profile = alpha_cut_profile(
+                    sample,
+                    metric=metric,
+                    linkage=result.parameters.get("linkage", "complete"),
+                )
+            except (ValueError, TypeError):
+                self.profile = []
         self.result_label.configure(text=self._summary_text(), foreground=OK_COLOR)
         self.refresh_legend()
         self.logger.log_clustering(result)
@@ -1246,11 +1307,26 @@ class ClusteringTab(ttk.Frame):
         parts.append(
             "silhouette = —" if silhouette is None else f"silhouette = {silhouette:.4f}"
         )
+        if self.profile:
+            key_levels = {1.0, 0.9, 0.8, 0.7, 0.5, 0.3}
+            shown = [
+                point
+                for point in self.profile
+                if round(float(point["alpha"]), 2) in key_levels
+            ]
+            parts.append(
+                "k(α): "
+                + ", ".join(
+                    f"{float(point['alpha']):.1f}→{point['cluster_count']}"
+                    for point in shown
+                )
+            )
         return "\n".join(parts)
 
     def _report_error(self, caption: str, exc: Exception) -> None:
         message = exc if isinstance(exc, str) else str(exc)
         self.result = None
+        self.profile = []
         self.cluster_table.clear()
         self.point_table.clear()
         self.result_label.configure(text=f"Ошибка: {message}", foreground=ERROR_COLOR)

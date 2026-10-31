@@ -125,6 +125,7 @@ UniformFuzzyVariable(a: float, b: float)
 | --- | --- |
 | `membership(x)` | `1.0`, если `a ≤ x ≤ b`, иначе `0.0` |
 | `mu(x)` | синоним `membership(x)` |
+| `alpha_cut(alpha=1.0)` | α-срез `{x : μ(x) ≥ alpha}`: для равномерной величины — `(a, b)` при `0 < alpha ≤ 1` и `()` при `alpha > 1` |
 | `a(x)` | вызов объекта как функции: `a(2)` равносильно `a.membership(2)` |
 
 **Арифметические операции.** Операндом может быть другая величина или число
@@ -318,6 +319,10 @@ generate_sample(3, count_range=(3, 3), seed=7)
 ```python
 kmeans(variables, k, *, metric="hausdorff", seed=None, max_iter=100, tol=1e-06)
 threshold_clustering(variables, *, threshold, metric="hausdorff")
+alpha_cut_clustering(variables, *, alpha=0.5, metric="hausdorff", linkage="single", closure=True, scale=None)
+alpha_cut_profile(variables, alphas=None, *, metric="hausdorff", linkage="single", closure=True, scale=None)
+similarity_matrix(variables, *, metric="hausdorff", scale=None)
+max_min_closure(similarity)
 density_clustering(variables, *, eps, min_points=2, metric="hausdorff")
 cluster(variables, method="kmeans", *, metric="hausdorff", **parameters)
 ```
@@ -337,8 +342,12 @@ cluster(variables, method="kmeans", *, metric="hausdorff", **parameters)
 | --- | --- |
 | `kmeans` | `k` — число кластеров, `seed` — зерно инициализации k-means++, `max_iter` — лимит итераций, `tol` — порог стабилизации центроидов |
 | `threshold_clustering` | `threshold` — максимальное допустимое расстояние внутри кластера (агломеративный алгоритм с полной связью) |
+| `alpha_cut_clustering` | `alpha` — уровень отбора из `(0, 1]` по шкале сходства `r_ij = 1 − d_ij/d0`; `linkage` — `"single"` (канонический α-срез: компоненты связности) или `"complete"` (разрез дендрограммы полной связи); `closure` — предварительное max-min замыкание (только для `"single"`); `scale` — масштаб `d0` (по умолчанию максимум расстояния в выборке) |
+| `alpha_cut_profile` | `alphas` — сетка уровней (по умолчанию `1.0, 0.9, …, 0.1`); возвращает список `{"alpha": уровень, "cluster_count": k}` |
+| `similarity_matrix` | матрица сходства `r_ij = 1 − d_ij/d0` со значениями из `[0, 1]`, `r_ii = 1` |
+| `max_min_closure` | max-min транзитивное замыкание матрицы сходства — нечёткое отношение эквивалентности |
 | `density_clustering` | `eps` — радиус окрестности, `min_points` — минимум точек в окрестности (включая саму точку) |
-| `cluster` | `method` — `"kmeans"`, `"threshold"` или `"density"`; остальные именованные аргументы передаются выбранному методу |
+| `cluster` | `method` — `"kmeans"`, `"threshold"`, `"alpha"` или `"density"`; остальные именованные аргументы передаются выбранному методу |
 
 **Ошибки**
 
@@ -350,11 +359,32 @@ cluster(variables, method="kmeans", *, metric="hausdorff", **parameters)
 | отрицательный порог | `threshold не может быть отрицательным, получено -1` |
 | `eps = 0` | `eps должен быть больше нуля, получено 0` |
 | `min_points = 0` | `min_points должен быть целым числом >= 1, получено 0` |
-| неизвестный метод | `Неизвестный метод кластеризации 'нет'. Доступны: density, kmeans, threshold` |
+| неизвестный метод | `Неизвестный метод кластеризации 'нет'. Доступны: alpha, density, kmeans, threshold` |
+| `alpha = 0` или `alpha > 1` | `α-уровень должен лежать в (0, 1], получено 1.5` |
+| неизвестный тип связи | `Неизвестный тип связи 'average'. Доступны: single, complete` |
+| отрицательный или нулевой `scale` | `масштаб расстояний должен быть положительным числом, получено 0` |
 | неизвестная метрика | `Неизвестная метрика 'манхэттен'. Доступны: euclidean, hausdorff` |
 
 Пустой набор данных не является ошибкой: `kmeans([], 1)` возвращает результат с
 нулевым числом кластеров.
+
+**Пример: кластеризация по α-уровню**
+
+```python
+from fuzzy_core import alpha_cut_clustering, alpha_cut_profile, generate_sample
+
+sample = generate_sample(150, seed=2026)
+
+result = alpha_cut_clustering(sample, alpha=0.7, linkage="complete")
+len(result.clusters)            # 5
+result.parameters               # {'alpha': 0.7, 'linkage': 'complete', 'closure': False, ...}
+
+[(p["alpha"], p["cluster_count"]) for p in alpha_cut_profile(sample, linkage="complete")]
+# [(1.0, 150), (0.9, 20), (0.8, 8), (0.7, 5), (0.6, 4), (0.5, 3), (0.4, 2), ...]
+```
+
+Число кластеров не убывает с ростом `alpha`: `alpha = 1` оставляет только
+совпадающие величины, малое `alpha` сливает всё в один кластер.
 
 **Класс `Cluster`** — один кластер.
 

@@ -134,3 +134,30 @@ def test_unpacking_and_repr():
     a, b = UniformFuzzyVariable(1.5, 2.5)
     assert (a, b) == (1.5, 2.5)
     assert "UniformFuzzyVariable" in repr(UniformFuzzyVariable(1, 2))
+
+
+# ----------------------------------------------------------------------
+# α-уровни (α-срезы)
+# ----------------------------------------------------------------------
+@pytest.mark.parametrize("alpha", [0.1, 0.5, 0.999, 1.0])
+def test_alpha_cut_of_uniform_variable_is_its_support(alpha):
+    variable = UniformFuzzyVariable(1.0, 3.0)
+    assert variable.alpha_cut(alpha) == (1.0, 3.0)
+
+
+def test_alpha_cut_is_empty_above_one():
+    assert UniformFuzzyVariable(1, 3).alpha_cut(1.5) == ()
+
+
+@pytest.mark.parametrize("alpha", [0.0, -0.5, math.inf, math.nan])
+def test_alpha_cut_rejects_invalid_level(alpha):
+    with pytest.raises(FuzzyVariableError):
+        UniformFuzzyVariable(1, 3).alpha_cut(alpha)
+
+
+def test_alpha_cut_matches_membership_test():
+    variable = UniformFuzzyVariable(-2, 4)
+    cut = variable.alpha_cut(0.7)
+    assert cut == variable.core
+    assert variable.membership(cut[0]) == 1.0
+    assert variable.membership(cut[1]) == 1.0

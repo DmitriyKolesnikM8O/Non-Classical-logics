@@ -4,6 +4,8 @@ import pytest
 
 from fuzzy_core import FuzzySet, UniformFuzzyVariable
 from gui.app import (
+    LINKAGE_LABELS,
+    METHOD_ALPHA,
     METHOD_DENSITY,
     METHOD_KMEANS,
     METHOD_THRESHOLD,
@@ -124,6 +126,52 @@ def test_read_parameters_per_method(tab):
     tab.threshold_entry.set("2,5")
     assert tab.read_parameters(METHOD_THRESHOLD) == {"threshold": 2.5}
     assert tab.read_parameters(METHOD_DENSITY) == {"eps": 0.5, "min_points": 2}
+
+
+def test_all_methods_have_radio_buttons(tab):
+    assert set(tab.method_buttons) == {
+        METHOD_KMEANS,
+        METHOD_THRESHOLD,
+        METHOD_ALPHA,
+        METHOD_DENSITY,
+    }
+
+
+def test_alpha_method_parameters(tab):
+    tab.alpha_entry.set("0,8")
+    assert tab.read_parameters(METHOD_ALPHA) == {"alpha": 0.8, "linkage": "complete"}
+    tab.linkage_var.set(LINKAGE_LABELS["single"])
+    assert tab.read_parameters(METHOD_ALPHA)["linkage"] == "single"
+
+
+def test_alpha_parameter_fields_switch_with_method(tab):
+    def state(entry):
+        return str(entry.entry.cget("state"))
+
+    tab.method_var.set(METHOD_ALPHA)
+    tab._update_parameter_state()
+    assert state(tab.alpha_entry) == "normal"
+    assert str(tab.linkage_box.cget("state")) == "readonly"
+    assert state(tab.k_entry) == "disabled"
+    assert state(tab.threshold_entry) == "disabled"
+    assert state(tab.eps_entry) == "disabled"
+
+    tab.method_var.set(METHOD_KMEANS)
+    tab._update_parameter_state()
+    assert state(tab.alpha_entry) == "disabled"
+    assert str(tab.linkage_box.cget("state")) == "disabled"
+
+
+def test_run_alpha_method_shows_level_profile(tab):
+    tab.method_var.set(METHOD_ALPHA)
+    tab._update_parameter_state()
+    result = tab.run()
+    assert result is not None
+    assert result.method == "alpha"
+    assert len(result.clusters) >= 1
+    text = result_text(tab)
+    assert "k(α)" in text
+    assert tab.profile and len(tab.profile) == 10
 
 
 def test_non_integer_parameters_rejected(tab):

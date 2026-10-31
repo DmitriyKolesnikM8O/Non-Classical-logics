@@ -6,12 +6,17 @@
 
 from .clustering import (
     CLUSTERING_METHODS,
+    DEFAULT_ALPHA_GRID,
     NOISE_LABEL,
     Cluster,
     ClusterResult,
+    alpha_cut_clustering,
+    alpha_cut_profile,
     cluster,
     density_clustering,
     kmeans,
+    max_min_closure,
+    similarity_matrix,
     threshold_clustering,
 )
 from .fuzzy_set import FuzzySet, FuzzySetError
@@ -46,6 +51,11 @@ __all__ = [
     "generate_variables",
     "kmeans",
     "threshold_clustering",
+    "alpha_cut_clustering",
+    "alpha_cut_profile",
+    "similarity_matrix",
+    "max_min_closure",
+    "DEFAULT_ALPHA_GRID",
     "density_clustering",
     "cluster",
     "Cluster",

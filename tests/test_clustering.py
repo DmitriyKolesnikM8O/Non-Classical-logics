@@ -8,9 +8,13 @@ from fuzzy_core import FuzzySet, UniformFuzzyVariable as V, generate_sample
 from fuzzy_core.clustering import (
     CLUSTERING_METHODS,
     NOISE_LABEL,
+    alpha_cut_clustering,
+    alpha_cut_profile,
     cluster,
     density_clustering,
     kmeans,
+    max_min_closure,
+    similarity_matrix,
     threshold_clustering,
 )
 
@@ -359,7 +363,7 @@ def test_cluster_dispatcher_rejects_unknown_method():
 
 
 def test_methods_registry_keys():
-    assert set(CLUSTERING_METHODS) == {"kmeans", "threshold", "density"}
+    assert set(CLUSTERING_METHODS) == {"kmeans", "threshold", "alpha", "density"}
 
 
 # ======================================================================
@@ -386,3 +390,116 @@ def test_points_by_cluster_matches_sizes():
     result = kmeans(left + middle + right, 3, seed=1)
     groups = result.points_by_cluster()
     assert [len(g) for g in groups] == result.sizes
+
+
+# ======================================================================
+# α-уровни: срезы отношения сходства
+# ======================================================================
+def test_similarity_matrix_is_bounded_and_symmetric():
+    left, middle, right = three_groups()
+    items = left + middle + right
+    matrix = similarity_matrix(items)
+    assert len(matrix) == len(items)
+    assert all(matrix[i][i] == pytest.approx(1.0) for i in range(len(items)))
+    for i in range(len(items)):
+        for j in range(len(items)):
+            assert 0.0 <= matrix[i][j] <= 1.0
+            assert matrix[i][j] == pytest.approx(matrix[j][i])
+
+
+def test_similarity_matrix_uses_explicit_scale():
+    matrix = similarity_matrix([V(0, 0), V(10, 10)], scale=20.0)
+    assert matrix[0][1] == pytest.approx(0.5)
+
+
+def test_similarity_matrix_all_variables_equal():
+    matrix = similarity_matrix([V(1, 2)] * 4)
+    assert all(value == pytest.approx(1.0) for row in matrix for value in row)
+
+
+def test_max_min_closure_gives_equivalence_relation():
+    left, middle, right = three_groups()
+    items = left + middle + right
+    matrix = similarity_matrix(items)
+    closed = max_min_closure(matrix)
+    size = len(closed)
+    for i in range(size):
+        assert closed[i][i] == pytest.approx(1.0)
+        for j in range(size):
+            assert closed[i][j] >= matrix[i][j] - 1e-12
+            assert closed[i][j] == pytest.approx(closed[j][i])
+            for k in range(size):
+                assert closed[i][j] >= min(closed[i][k], closed[k][j]) - 1e-12
+
+
+def test_alpha_level_changes_cluster_count():
+    left, middle, right = three_groups()
+    items = left + middle + right
+    strict = alpha_cut_clustering(items, alpha=1.0)
+    assert strict.method == "alpha"
+    assert len(strict.clusters) == len(items)
+    loose = alpha_cut_clustering(items, alpha=0.05)
+    assert len(loose.clusters) == 1
+
+
+def test_alpha_complete_linkage_splits_three_groups():
+    left, middle, right = three_groups()
+    result = alpha_cut_clustering(left + middle + right, alpha=0.95, linkage="complete")
+    assert result.sizes == [5, 5, 5]
+
+
+def test_alpha_complete_matches_threshold_with_converted_level():
+    left, middle, right = three_groups()
+    items = left + middle + right
+    scale, alpha = 40.0, 0.9
+    by_alpha = alpha_cut_clustering(items, alpha=alpha, linkage="complete", scale=scale)
+    by_threshold = threshold_clustering(items, threshold=(1.0 - alpha) * scale)
+    assert by_alpha.sizes == by_threshold.sizes
+
+
+def test_alpha_profile_is_monotone_for_both_linkages():
+    items = [V(0, 0.2), V(0.5, 0.7), V(5, 5.2), V(5.4, 5.6), V(20, 20.2)]
+    levels = (1.0, 0.95, 0.9, 0.8, 0.5, 0.1)
+    for linkage in ("single", "complete"):
+        counts = [
+            point["cluster_count"]
+            for point in alpha_cut_profile(items, levels, linkage=linkage)
+        ]
+        assert counts == sorted(counts, reverse=True)
+        assert counts[0] == len(items)
+
+
+def test_alpha_profile_matches_clustering_for_both_linkages():
+    items = [V(0, 0.2), V(0.5, 0.7), V(5, 5.2), V(5.4, 5.6), V(20, 20.2)]
+    levels = (1.0, 0.9, 0.7, 0.3)
+    for linkage in ("single", "complete"):
+        for point in alpha_cut_profile(items, levels, linkage=linkage):
+            direct = alpha_cut_clustering(
+                items, alpha=point["alpha"], linkage=linkage
+            )
+            assert len(direct.clusters) == point["cluster_count"]
+
+
+def test_alpha_rejects_bad_levels_and_linkage():
+    items = [V(0, 0), V(1, 1)]
+    for bad in (0.0, -0.5, 1.5, float("nan")):
+        with pytest.raises(ValueError):
+            alpha_cut_clustering(items, alpha=bad)
+    with pytest.raises(ValueError):
+        alpha_cut_clustering(items, alpha=0.5, linkage="average")
+    with pytest.raises(ValueError):
+        alpha_cut_clustering(items, alpha=0.5, metric="manhattan")
+
+
+def test_alpha_on_empty_sample():
+    assert len(alpha_cut_clustering([], alpha=0.5).clusters) == 0
+    assert alpha_cut_profile([], [0.5]) == [{"alpha": 0.5, "cluster_count": 0}]
+
+
+def test_alpha_via_unified_entry_point_records_parameters():
+    items = [V(0, 0.2), V(0.5, 0.7), V(5, 5.2)]
+    result = cluster(items, "alpha", alpha=0.8, linkage="complete")
+    assert result.method == "alpha"
+    assert result.parameters["alpha"] == 0.8
+    assert result.parameters["linkage"] == "complete"
+    assert result.to_dict()["cluster_count"] == len(result.clusters)

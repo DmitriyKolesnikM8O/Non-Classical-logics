@@ -130,6 +130,27 @@ class UniformFuzzyVariable:
 
     mu = membership
 
+    def alpha_cut(self, alpha: float = 1.0) -> Tuple[float, ...]:
+        """α-срез носителя: отрезок ``{x : mu(x) >= alpha}``.
+
+        Для равномерной функции принадлежности срез **не зависит** от уровня:
+        при любом ``0 < alpha <= 1`` он совпадает с носителем ``[a, b]``,
+        а при ``alpha > 1`` срез пуст (возвращается пустой кортеж).
+        Поэтому в варианте 1 осмысленный «уровень отбора» задаётся не на
+        величине, а на отношении сходства между величинами — см.
+        :func:`fuzzy_core.clustering.alpha_cut_clustering`.
+        """
+        alpha = float(alpha)
+        if not math.isfinite(alpha):
+            raise FuzzyVariableError("α-уровень должен быть конечным числом")
+        if alpha <= 0.0:
+            raise FuzzyVariableError(
+                f"α-уровень должен быть больше нуля, получено {alpha!r}"
+            )
+        if alpha > 1.0:
+            return ()
+        return (self._a, self._b)
+
     def __call__(self, x: float) -> float:
         """``v(x)`` — сокращённая запись для ``v.mu(x)``."""
         return self.membership(x)
