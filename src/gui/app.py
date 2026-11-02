@@ -23,13 +23,16 @@ from fuzzy_core import (
     MAX_COUNT,
     MIN_COUNT,
     NOISE_LABEL,
+    Agglomeration,
     AlphaClusterer,
     ClusterResult,
     FuzzySet,
     UniformFuzzyVariable,
+    agglomerate,
     cluster,
     generate_sample,
     get_distance_function,
+    grouped_result,
 )
 from logger import SessionLogger, describe_variable, format_variable
 
@@ -166,7 +169,7 @@ class FuzzyApp:
         self.main_menu = menu_bar
         self.file_menu = file_menu
         self.help_menu = help_menu
-        self.root.configure(menu=menu_bar)
+        self.root["menu"] = menu_bar
 
     def _build_tabs(self) -> None:
         self.notebook = ttk.Notebook(self.root)
@@ -879,6 +882,12 @@ ALPHA_MAX = 1.0
 ALPHA_DEBOUNCE_MS = 90
 ALPHA_PLAY_INTERVAL_MS = 600
 
+#: Пауза между шагами «проигрывания» агломерации и границы скорости (шагов/с).
+STEP_PLAY_INTERVAL_MS = 400
+STEP_SPEED_MIN = 1.0
+STEP_SPEED_MAX = 20.0
+STEP_SPEED_DEFAULT = 1000.0 / STEP_PLAY_INTERVAL_MS
+
 
 class ClusteringTab(ttk.Frame):
     """Кластерный анализ сгенерированной выборки.
@@ -919,6 +928,18 @@ class ClusteringTab(ttk.Frame):
         self._play_index = 0
         self._stale_views: set = set()
 
+        # Пошаговая агломерация: трасса полной связи и позиция в ней.
+        self.trace: Optional[Agglomeration] = None
+        self._trace_key: Optional[Tuple[int, str]] = None
+        self.step_index = 0
+        self._step_playing = False
+        self._step_job: Optional[str] = None
+        self._syncing_speed = False
+        # Во время проигрывания таблицы и легенда не пересобираются на каждом
+        # шаге (это самая дорогая часть отрисовки); флаг говорит, что их нужно
+        # обновить один раз при остановке.
+        self._step_ui_stale = False
+
         self.rowconfigure(1, weight=1)
         self.columnconfigure(1, weight=1)
 
@@ -931,8 +952,33 @@ class ClusteringTab(ttk.Frame):
     # Построение интерфейса
     # ------------------------------------------------------------------
     def _build_controls(self) -> None:
-        panel = ttk.Frame(self)
-        panel.grid(row=0, column=0, rowspan=2, sticky="nsw", padx=(0, 10))
+        # Прокручиваемый левый столбец: контейнер с канвасом (содержимое слева)
+        # и полосой прокрутки справа — не накладываются.
+        # Разделитель с возможностью изменения ширины левой панели (как между
+        # графиком и таблицами). Левый столбец — прокручиваемый, правый — график.
+        self.main_pane = tk.PanedWindow(self, sashwidth=6, sashrelief=tk.RAISED, sashpad=2)
+        self.main_pane.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # Левая панель (прокручиваемая)
+        scroll_container = ttk.Frame(self.main_pane, width=260)
+        scroll_container.pack_propagate(False)
+        self.main_pane.add(scroll_container, minsize=220, sticky="nsew")
+
+        scroll_container.columnconfigure(0, weight=1)
+        scroll_container.rowconfigure(0, weight=1)
+
+        panel_outer = tk.Canvas(scroll_container, highlightthickness=0, width=240)
+        panel_outer.grid(row=0, column=0, sticky="nsew")
+        scrollbar_outer = ttk.Scrollbar(scroll_container, orient="vertical", command=panel_outer.yview)
+        scrollbar_outer.grid(row=0, column=1, sticky="ns")
+        panel_outer.configure(yscrollcommand=scrollbar_outer.set)
+        panel = ttk.Frame(panel_outer)
+        panel_outer.create_window((0, 0), window=panel, anchor="nw")
+        def _update_scrollregion(event=None):
+            bbox = panel_outer.bbox("all")
+            panel_outer.configure(scrollregion=(0, 0, bbox[2] if bbox else 0, bbox[3] if bbox else 0))
+        panel.bind("<Configure>", _update_scrollregion)
+        self.bind("<Configure>", lambda e: self.after_idle(_update_scrollregion))
 
         data = ttk.LabelFrame(panel, text="Данные", padding=10)
         data.pack(fill="x")
@@ -1045,6 +1091,58 @@ class ClusteringTab(ttk.Frame):
         self.run_button = ttk.Button(buttons, text="Кластеризовать", command=self.run)
         self.run_button.pack(fill="x")
 
+        # Пошаговая агломерация (полная связь) для метода «по порогу».
+        steps = ttk.LabelFrame(panel, text="Пошаговая агломерация", padding=10)
+        steps.pack(fill="x", pady=(8, 0))
+        step_row = ttk.Frame(steps)
+        step_row.pack(fill="x")
+        self.step_label = ttk.Label(step_row, text=self._step_text(0, 0), font=TEXT_FONT)
+        self.step_label.pack(side="left")
+        self.step_button = ttk.Button(
+            step_row, text="Шаг", width=5, command=self.step_agglomeration
+        )
+        self.step_button.pack(side="left", padx=(6, 0))
+        self.step_play_button = ttk.Button(
+            step_row, text="▶", width=3, command=self.toggle_step_play
+        )
+        self.step_play_button.pack(side="left", padx=(4, 0))
+        self.step_reset_button = ttk.Button(
+            step_row, text="↺", width=3, command=self.reset_agglomeration
+        )
+        self.step_reset_button.pack(side="left", padx=(4, 0))
+
+        # Останов на пороге кластеризации: по умолчанию анимация доходит ровно
+        # до разбиения кнопки «Кластеризовать» (разрез дендрограммы по порогу).
+        self.step_stop_var = tk.BooleanVar(value=True)
+        self.step_stop_check = ttk.Checkbutton(
+            steps,
+            text="останавливаться на пороге",
+            variable=self.step_stop_var,
+            command=self._on_step_stop_changed,
+        )
+        self.step_stop_check.pack(anchor="w", pady=(6, 0))
+
+        # Скорость проигрывания: 1..20 шагов в секунду (больше — быстрее).
+        speed_row = ttk.Frame(steps)
+        speed_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(speed_row, text="скорость", font=TEXT_FONT).pack(side="left")
+        # Начальное значение задаём ДО подписки на command: ttk.Scale.set
+        # вызывает обработчик, а подписи ещё нет.
+        self.step_speed_scale = ttk.Scale(
+            speed_row,
+            from_=STEP_SPEED_MIN,
+            to=STEP_SPEED_MAX,
+            orient="horizontal",
+            length=96,
+        )
+        self.step_speed_scale.set(STEP_SPEED_DEFAULT)
+        self.step_speed_scale.pack(side="left", padx=(6, 0))
+        self.step_speed_label = ttk.Label(
+            speed_row, text=self._speed_text(STEP_SPEED_DEFAULT), font=TEXT_FONT
+        )
+        self.step_speed_label.pack(side="left", padx=(6, 0))
+        self.step_speed_scale.configure(command=self._on_step_speed)
+
         summary = ttk.LabelFrame(panel, text="Результат", padding=10)
         summary.pack(fill="x", pady=(8, 0))
         self.result_label = ttk.Label(
@@ -1054,11 +1152,50 @@ class ClusteringTab(ttk.Frame):
         self.result_label.pack(anchor="w")
 
         self._update_parameter_state()
+        self.scroll_container = scroll_container
+        self.panel_outer = panel_outer
+        self.panel_canvas = panel_outer
+        self.panel_scrollbar = scrollbar_outer
+        self.panel_frame = panel
+        self._bind_panel_mousewheel(scroll_container)
+
+    def _on_panel_mousewheel(self, event: object) -> str:
+        """Обработка прокрутки колесом мыши левой панели."""
+        delta = getattr(event, "delta", 0)
+        num = getattr(event, "num", 0)
+        if delta:
+            step = -int(delta / 120) if abs(delta) >= 120 else (-1 if delta > 0 else 1)
+        elif num == 4:
+            step = -1
+        elif num == 5:
+            step = 1
+        else:
+            return "break"
+        self.panel_outer.yview_scroll(step * 3, "units")
+        return "break"
+
+    def _bind_panel_mousewheel(self, widget: tk.Misc) -> None:
+        """Рекурсивно привязать прокрутку колесом мыши ко всем дочерним виджетам панели."""
+        widget.bind("<MouseWheel>", self._on_panel_mousewheel)
+        widget.bind("<Button-4>", self._on_panel_mousewheel)
+        widget.bind("<Button-5>", self._on_panel_mousewheel)
+        for child in widget.winfo_children():
+            self._bind_panel_mousewheel(child)
+
 
     def _build_plot(self) -> None:
-        # Кнопка полной легенды — над графиком.
-        self.plot_toolbar = ttk.Frame(self)
-        self.plot_toolbar.grid(row=0, column=1, sticky="ew")
+        # Правый контейнер для графика и таблиц — добавляется в PanedWindow
+        # вместе с левой прокручиваемой панелью, давая пользователю разделитель.
+        self.right_pane = ttk.Frame(self)
+        self.main_pane.add(self.right_pane, sticky="nsew")
+        self.main_pane.paneconfigure(self.right_pane, minsize=300)
+
+        # Кнопка полной легенды — над графиком (внутри правой панели).
+        self.right_pane.rowconfigure(0, weight=0)
+        self.right_pane.rowconfigure(1, weight=1)
+        self.right_pane.columnconfigure(0, weight=1)
+        self.plot_toolbar = ttk.Frame(self.right_pane)
+        self.plot_toolbar.grid(row=0, column=0, sticky="ew")
         self.legend_button = ttk.Button(
             self.plot_toolbar,
             text="Легенда",
@@ -1069,8 +1206,8 @@ class ClusteringTab(ttk.Frame):
 
         # График и таблицы — в раздвижной панели: пользователь сам решает,
         # чему отдать больше места, и ничего не уезжает за край окна.
-        self.paned = ttk.PanedWindow(self, orient="vertical")
-        self.paned.grid(row=1, column=1, sticky="nsew")
+        self.paned = ttk.PanedWindow(self.right_pane, orient="vertical")
+        self.paned.grid(row=1, column=0, sticky="nsew")
 
         # Внутри верхней части — ещё одна раздвижная панель: график + легенда.
         self.plot_area = ttk.PanedWindow(self.paned, orient="horizontal")
@@ -1095,6 +1232,9 @@ class ClusteringTab(ttk.Frame):
 
         self.legend_panel = LegendPanel(self.plot_area)
         self.legend_visible = False
+        # Скрытая панель не пересобирается: сотни Tk-виджетов — дорогая часть
+        # перерисовки. При открытии содержимое соберётся из свежих данных.
+        self._legend_stale = False
 
     def _sync_view_tabs(self) -> None:
         """Разрешить закладки профиля и матрицы только для метода α-уровня.
@@ -1133,14 +1273,26 @@ class ClusteringTab(ttk.Frame):
             self.plot_area.forget(self.legend_panel)
             self.legend_visible = False
         else:
+            if self._legend_stale:
+                self.legend_panel.set_items(self._legend_items())
+                self._legend_stale = False
             self.plot_area.add(self.legend_panel, weight=1)
             self.legend_visible = True
         self._update_legend_button()
         return self.legend_visible
 
     def refresh_legend(self) -> None:
-        """Пересобрать содержимое панели легенды по текущему результату."""
-        self.legend_panel.set_items(self._legend_items())
+        """Пересобрать содержимое панели легенды по текущему результату.
+
+        Пока панель скрыта, строки не создаются (это самая дорогая часть
+        перерисовки при десятках кластеров); при открытии панель соберётся из
+        свежих данных — см. :meth:`toggle_legend`.
+        """
+        if self.legend_visible:
+            self.legend_panel.set_items(self._legend_items())
+            self._legend_stale = False
+        else:
+            self._legend_stale = True
         self._update_legend_button()
 
     def _update_legend_button(self) -> None:
@@ -1223,6 +1375,19 @@ class ClusteringTab(ttk.Frame):
         self.play_button.configure(state="normal" if is_alpha else "disabled")
         if not is_alpha:
             self.stop_alpha_play()
+        # Пошаговая агломерация относится к методу «по порогу» (полная связь).
+        is_threshold = method == METHOD_THRESHOLD
+        step_state = "normal" if is_threshold else "disabled"
+        for widget in (
+            self.step_button,
+            self.step_play_button,
+            self.step_reset_button,
+            self.step_speed_scale,
+            self.step_stop_check,
+        ):
+            widget.configure(state=step_state)
+        if not is_threshold:
+            self.stop_step_play()
         # Профиль и матрица относятся только к α-уровню; до создания блокнота
         # (в _build_controls) синхронизация ещё невозможна.
         if hasattr(self, "view_notebook"):
@@ -1523,6 +1688,276 @@ class ClusteringTab(ttk.Frame):
         self._play_job = self.after(ALPHA_PLAY_INTERVAL_MS, self._tick_alpha_play)
 
     # ------------------------------------------------------------------
+    # Пошаговая агломерация (полная связь)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _step_text(done: int, total: int) -> str:
+        """Подпись текущего шага агломерации."""
+        return f"шаг {done}/{total}"
+
+    @staticmethod
+    def _speed_text(speed: float) -> str:
+        """Подпись скорости проигрывания (шагов в секунду)."""
+        return f"{float(speed):.1f}/с"
+
+    @staticmethod
+    def _interval_for(speed: float) -> int:
+        """Интервал в миллисекундах для скорости в шагах в секунду."""
+        value = max(STEP_SPEED_MIN, float(speed))
+        return max(30, int(round(1000.0 / value)))
+
+    def step_interval_ms(self) -> int:
+        """Пауза между шагами проигрывания по текущей скорости ползунка."""
+        return self._interval_for(float(self.step_speed_scale.get()))
+
+    def set_step_speed(self, speed: float, *, reschedule: bool = True) -> float:
+        """Задать скорость проигрывания (шагов в секунду) и обновить подпись."""
+        value = min(STEP_SPEED_MAX, max(STEP_SPEED_MIN, float(speed)))
+        self._syncing_speed = True
+        try:
+            self.step_speed_scale.set(value)
+        finally:
+            self._syncing_speed = False
+        self.step_speed_label.configure(text=self._speed_text(value))
+        if reschedule and self._step_playing and self._step_job is not None:
+            # Перепланируем ближайший шаг, чтобы новая скорость действовала сразу.
+            self.after_cancel(self._step_job)
+            self._step_job = self.after(self._interval_for(value), self._tick_step_play)
+        return value
+
+    def _on_step_speed(self, value: object) -> None:
+        """Ползунок скорости сдвинулся."""
+        if self._syncing_speed:
+            return
+        self.set_step_speed(float(value))
+
+    def get_trace(self, sample: FuzzySet, metric: str) -> Agglomeration:
+        """Кэшированная трасса агломерации полной связи для выборки.
+
+        Трасса считается один раз на комбинацию «выборка + метрика»: дальше
+        каждый шаг — это просто срез уже готовой последовательности слияний, а
+        не повторный пересчёт матрицы расстояний.
+        """
+        key = (id(sample), metric)
+        if self.trace is None or self._trace_key != key:
+            self.trace = agglomerate(sample, metric=metric)
+            self._trace_key = key
+            self.step_index = 0
+            self._update_step_label()
+        return self.trace
+
+    def _step_max(self) -> int:
+        """Максимальный шаг, до которого идёт анимация.
+
+        Если включена галочка «останавливаться на пороге» — предел равен
+        шагу разреза дендрограммы по текущему порогу метода. Иначе — весь
+        процесс до одного кластера.
+        """
+        if not self.step_stop_var.get():
+            return len(self.trace.merges) if self.trace is not None else 0
+        # Для метода «по порогу» читаем порог из параметров и считаем шаг разреза.
+        try:
+            threshold = self.threshold_entry.number()
+        except (ValueError, TypeError):
+            threshold = 1.0
+        if self.trace is not None:
+            return self.trace.cut_step(threshold)
+        return 0
+
+    def _on_step_stop_changed(self) -> None:
+        """Галочка «останавливаться на пороге» переключилась."""
+        if self._step_playing and self.step_index >= self._step_max():
+            self.stop_step_play()
+        else:
+            self._update_step_label()
+
+    def _update_step_label(self) -> None:
+        total = len(self.trace.merges) if self.trace is not None else 0
+        limit = self._step_max() if self.step_stop_var.get() else total
+        self.step_label.configure(text=self._step_text(self.step_index, limit))
+
+    def reset_agglomeration(self) -> Optional[Agglomeration]:
+        """Вернуть агломерацию к началу: все величины — отдельные кластеры."""
+        if self.method_var.get() != METHOD_THRESHOLD:
+            return None
+        sample = self.current_sample()
+        if sample is None or len(sample) == 0:
+            self._report_error(
+                "Пошаговая агломерация",
+                "выборка пуста — сначала сгенерируйте её на вкладке «Генерация и выборка»",
+            )
+            return None
+        try:
+            trace = self.get_trace(sample, self.metric_var.get())
+        except (ValueError, TypeError) as exc:
+            self._report_error("Пошаговая агломерация", exc)
+            return None
+        self.step_index = 0
+        self._update_step_label()
+        self._step_ui_stale = False
+        self._present_step(trace)
+        self.on_message(f"Агломерация: исходное состояние, {trace.size} кластеров")
+        return trace
+
+    def step_agglomeration(self, *, update_tables: bool = True) -> Optional[int]:
+        """Выполнить один шаг агломерации (слить следующую пару кластеров).
+
+        Публичный метод без таймеров: его вызывают и кнопка «Шаг», и тесты.
+        Возвращает номер выполненного шага или ``None``, если шагов больше нет
+        либо выбран другой метод.
+
+        ``update_tables=False`` используется при автоматическом проигрывании:
+        диаграмма и сводка обновляются, а тяжёлые таблицы и легенда — нет.
+        Их пересобирает :meth:`stop_step_play`, когда проигрывание закончится.
+        """
+        if self.method_var.get() != METHOD_THRESHOLD:
+            return None
+        sample = self.current_sample()
+        if sample is None or len(sample) == 0:
+            self._report_error(
+                "Пошаговая агломерация",
+                "выборка пуста — сначала сгенерируйте её на вкладке «Генерация и выборка»",
+            )
+            return None
+        try:
+            trace = self.get_trace(sample, self.metric_var.get())
+        except (ValueError, TypeError) as exc:
+            self._report_error("Пошаговая агломерация", exc)
+            return None
+        max_step = self._step_max()
+        if self.step_index >= max_step:
+            self.stop_step_play()
+            # Если остановились на пороге, показываем подсказку в сводке.
+            if self.step_stop_var.get() and max_step > 0:
+                try:
+                    threshold = self.threshold_entry.number()
+                    clusters = len(self.result.clusters) if self.result else 0
+                    note = (
+                        f" (достигнут порог {threshold:g} — {clusters} кластеров; "
+                        f"увеличьте порог, чтобы продолжить)"
+                    )
+                except Exception:
+                    note = " (достигнут порог кластеризации)"
+                current_text = self.result_label.cget("text")
+                if note not in current_text:
+                    self.result_label.configure(text=current_text + note)
+            return None
+        self.step_index += 1
+        self._update_step_label()
+        merge = trace.steps()[self.step_index - 1]
+        self.logger.info(
+            f"Агломерация, {merge.describe()}; кластеров осталось {merge.cluster_count}"
+        )
+        self._present_step(trace, update_tables=update_tables)
+        return self.step_index
+
+    def toggle_step_play(self) -> bool:
+        """Запустить или остановить проигрывание агломерации по шагам."""
+        if self._step_playing:
+            self.stop_step_play()
+            return False
+        self.start_step_play()
+        return self._step_playing
+
+    def start_step_play(self) -> None:
+        """Начать автоматический перебор шагов агломерации."""
+        if self.method_var.get() != METHOD_THRESHOLD:
+            return
+        sample = self.current_sample()
+        if sample is None or len(sample) == 0:
+            self._report_error(
+                "Пошаговая агломерация",
+                "выборка пуста — сначала сгенерируйте её на вкладке «Генерация и выборка»",
+            )
+            return
+        trace = self.get_trace(sample, self.metric_var.get())
+        # Если включена галочка «останавливаться на пороге» и порог меньше
+        # последнего слияния, сбрасываем на начало, чтобы начать с шага 0.
+        if self.step_stop_var.get() and self.step_index >= self._step_max():
+            pass  # оставляем текущее состояние, не сбрасываем
+        if self.step_index >= len(trace.merges) and not self.step_stop_var.get():
+            self.reset_agglomeration()  # дошли до конца — начинаем заново
+        max_step = self._step_max()
+        if max_step == 0:
+            self.reset_agglomeration()
+        self._step_playing = True
+        self.step_play_button.configure(text="■")
+        self._tick_step_play()
+
+    def stop_step_play(self) -> None:
+        """Остановить проигрывание и вернуть кнопку в исходный вид."""
+        was_playing = self._step_playing
+        self._step_playing = False
+        if self._step_job is not None:
+            self.after_cancel(self._step_job)
+            self._step_job = None
+        if hasattr(self, "step_play_button"):
+            self.step_play_button.configure(text="▶")
+        if was_playing and self._step_ui_stale and self.result is not None:
+            # Во время проигрывания таблицы и легенда не пересобирались —
+            # догоняем их один раз по остановке.
+            self._step_ui_stale = False
+            self.fill_tables()
+            self.refresh_legend()
+
+    def _tick_step_play(self) -> None:
+        self._step_job = None
+        if not self._step_playing:
+            return
+        if self.step_agglomeration(update_tables=False) is None:
+            self.stop_step_play()
+            return
+        self._step_job = self.after(self.step_interval_ms(), self._tick_step_play)
+
+    def _present_step(
+        self, trace: Agglomeration, *, update_tables: bool = True
+    ) -> None:
+        """Показать разбиение после текущего числа слияний."""
+        sample = self.current_sample()
+        if sample is None:
+            return
+        total = len(trace.merges)
+        if self.step_index == 0:
+            # Исходное состояние: кластеров ещё нет, точки рисуются серыми.
+            labels = [NOISE_LABEL] * trace.size
+            title = "Исходная выборка: шагов не выполнено"
+        else:
+            labels = trace.labels_after(self.step_index)
+            title = f"Агломерация: шаг {self.step_index}/{total}"
+        self.result = grouped_result(
+            sample,
+            labels,
+            method=METHOD_THRESHOLD,
+            metric=self.metric_var.get(),
+            parameters={"step": self.step_index, "steps_total": total},
+        )
+        self.profile = []
+        if update_tables:
+            self._step_ui_stale = False
+            self.fill_tables()
+        else:
+            # Таблицы догонят по остановке проигрывания (см. stop_step_play).
+            self._step_ui_stale = True
+        self.show_plot(title=title)
+        self.result_label.configure(
+            text=self._step_summary(trace), foreground=OK_COLOR
+        )
+        if update_tables:
+            self.refresh_legend()
+
+    def _step_summary(self, trace: Agglomeration) -> str:
+        total = len(trace.merges)
+        if self.step_index == 0:
+            first = (
+                f"Исходное состояние: все {trace.size} величин — отдельные кластеры."
+            )
+        else:
+            merge = trace.steps()[self.step_index - 1]
+            first = f"{merge.describe()} (всего шагов: {total})"
+        clusters = len(self.result.clusters) if self.result is not None else 0
+        return f"{first}\nКластеров: {clusters}."
+
+    # ------------------------------------------------------------------
     # Вывод результатов
     # ------------------------------------------------------------------
     def fill_tables(self) -> None:
@@ -1558,11 +1993,20 @@ class ClusteringTab(ttk.Frame):
             )
         )
 
-    def show_plot(self) -> None:
-        """Построить диаграмму рассеяния по кластерам."""
+    def show_plot(self, title: Optional[str] = None) -> None:
+        """Построить диаграмму рассеяния по кластерам.
+
+        ``title`` задаётся для пошагового просмотра; по умолчанию заголовок
+        собирается из метода и метрики текущего результата.
+        """
         result = self.result
         if result is None:
             return
+        if title is None:
+            title = (
+                f"Кластеры ({METHOD_LABELS.get(result.method, result.method)}, "
+                f"метрика {result.metric})"
+            )
         self.plot.show_scatter(
             [(variable.center, variable.width) for variable in result.items],
             result.labels,
@@ -1570,10 +2014,7 @@ class ClusteringTab(ttk.Frame):
                 (cluster.centroid.center, cluster.centroid.width)
                 for cluster in result.clusters
             ],
-            title=(
-                f"Кластеры ({METHOD_LABELS.get(result.method, result.method)}, "
-                f"метрика {result.metric})"
-            ),
+            title=title,
         )
 
     def _summary_text(self, *, include_silhouette: bool = True) -> str:

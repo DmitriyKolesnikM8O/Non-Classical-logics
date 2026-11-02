@@ -259,21 +259,36 @@ class MembershipPlot(ttk.Frame):
         if NOISE_LABEL in ordered:
             self._group_colors[NOISE_LABEL] = NOISE_COLOR
 
-        for group in ordered:
-            pair = [
-                (x, y) for (x, y), label in zip(items, labels) if label == group
-            ]
-            caption = "шум" if group < 0 else f"кластер {group}"
+        if len(ordered) > max_legend_items:
+            # Много групп: одна коллекция точек с цветом на каждую точку вместо
+            # сотен отдельных вызовов scatter. Иначе перерисовка при десятках
+            # кластеров (и особенно пошаговая анимация) занимает секунды.
+            show_legend = False
             self.axes.scatter(
-                [x for x, _ in pair],
-                [y for _, y in pair],
+                [x for x, _ in items],
+                [y for _, y in items],
                 s=26,
                 alpha=0.8,
                 edgecolors="none",
-                label=caption,
-                color=self._group_colors[group],
+                c=[self._group_colors[label] for label in labels],
             )
-            self._labels.append(caption)
+        else:
+            show_legend = True
+            for group in ordered:
+                pair = [
+                    (x, y) for (x, y), label in zip(items, labels) if label == group
+                ]
+                caption = "шум" if group < 0 else f"кластер {group}"
+                self.axes.scatter(
+                    [x for x, _ in pair],
+                    [y for _, y in pair],
+                    s=26,
+                    alpha=0.8,
+                    edgecolors="none",
+                    label=caption,
+                    color=self._group_colors[group],
+                )
+                self._labels.append(caption)
 
         if self._centroids:
             self.axes.scatter(
@@ -288,7 +303,7 @@ class MembershipPlot(ttk.Frame):
             self._labels.append("центры кластеров")
 
         if items:
-            if len(self._labels) <= max_legend_items:
+            if show_legend and self._labels:
                 self.axes.legend(loc="upper right", fontsize=8)
             self.redraw()
 

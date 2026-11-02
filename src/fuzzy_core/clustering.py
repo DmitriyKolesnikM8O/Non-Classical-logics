@@ -38,6 +38,7 @@ __all__ = [
     "Cluster",
     "ClusterResult",
     "Agglomeration",
+    "Merge",
     "AlphaClusterer",
     "kmeans",
     "threshold_clustering",
@@ -45,6 +46,8 @@ __all__ = [
     "alpha_cut_profile",
     "similarity_matrix",
     "max_min_closure",
+    "agglomerate",
+    "grouped_result",
     "density_clustering",
     "cluster",
     "CLUSTERING_METHODS",
@@ -287,6 +290,42 @@ def _build_result(
     )
 
 
+def grouped_result(
+    variables: Iterable[object],
+    labels: Sequence[int],
+    *,
+    method: str,
+    metric: str = "hausdorff",
+    parameters: Optional[Dict[str, Any]] = None,
+) -> ClusterResult:
+    """Собрать :class:`ClusterResult` из готовых меток кластеров.
+
+    Нужно, когда разбиение получено не отдельным методом, а, например, разрезом
+    трассы агломерации на заданном шаге (см. :meth:`Agglomeration.labels_after`).
+    Метки ``NOISE_LABEL`` считаются шумом и в кластеры не попадают.
+    """
+    items = _as_items(variables)
+    if len(labels) != len(items):
+        raise ValueError(
+            f"меток {len(labels)}, а величин {len(items)} — размеры должны совпадать"
+        )
+    grouped: Dict[int, List[int]] = {}
+    noise: List[int] = []
+    for index, label in enumerate(labels):
+        if int(label) == NOISE_LABEL:
+            noise.append(index)
+            continue
+        grouped.setdefault(int(label), []).append(index)
+    return _build_result(
+        items,
+        list(grouped.values()),
+        method,
+        metric,
+        dict(parameters or {}),
+        noise=noise or None,
+    )
+
+
 # ----------------------------------------------------------------------
 # K-Means на заданное число кластеров
 # ----------------------------------------------------------------------
@@ -424,6 +463,36 @@ def kmeans(
 # Кластеризация по порогу (полная связь)
 # ----------------------------------------------------------------------
 @dataclass(frozen=True)
+class Merge:
+    """Одно слияние в агломеративном процессе (полная связь).
+
+    Шаги нумеруются с единицы: на шаге ``step`` объединяются два кластера,
+    состоящие из исходных величин ``left`` и ``right``, на расстоянии
+    ``height``. После слияния остаётся кластер ``members`` (объединение), а
+    всего кластеров становится ``cluster_count``.
+    """
+
+    step: int
+    left: Tuple[int, ...]
+    right: Tuple[int, ...]
+    height: float
+    cluster_count: int
+    members: Tuple[int, ...]
+
+    @property
+    def member_count(self) -> int:
+        """Число исходных величин в объединённом кластере."""
+        return len(self.members)
+
+    def describe(self) -> str:
+        """Короткое описание шага для журнала и подписи в интерфейсе."""
+        return (
+            f"шаг {self.step}: слияние кластеров размерами {len(self.left)} и "
+            f"{len(self.right)} на расстоянии {self.height:.4f}"
+        )
+
+
+@dataclass(frozen=True)
 class Agglomeration:
     """Трасса агломеративной кластеризации (критерий полной связи).
 
@@ -432,6 +501,10 @@ class Agglomeration:
     По трассе можно быстро получить разбиение при любом пороге (см.
     :meth:`labels`), не пересчитывая матрицу расстояний заново — это и нужно
     интерфейсу для интерактивного перебора уровня.
+
+    Кроме разреза по высоте трасса позволяет «проигрывать» процесс по шагам:
+    :meth:`steps` отдаёт состав сливающихся кластеров, :meth:`labels_after` —
+    разбиение после выбранного числа слияний (см. пошаговую агломерацию в GUI).
     """
 
     size: int
@@ -442,12 +515,8 @@ class Agglomeration:
         """Высоты слияний по порядку их выполнения."""
         return tuple(height for _, _, height in self.merges)
 
-    def labels(self, threshold: float) -> List[int]:
-        """Метки кластеров при разрезе дендрограммы на высоте ``threshold``.
-
-        Слияния выше порога не выполняются. Метки неотрицательны и нумеруются
-        в порядке появления; у элементов одного кластера метка совпадает.
-        """
+    def _labels_from(self, merges: Iterable[Tuple[int, int, float]]) -> List[int]:
+        """Метки кластеров после указанных слияний (общая часть ``labels*``)."""
         parent = list(range(self.size))
 
         def find(index: int) -> int:
@@ -456,9 +525,7 @@ class Agglomeration:
                 index = parent[index]
             return index
 
-        for first, second, height in self.merges:
-            if height > threshold + _HEIGHT_EPS:
-                continue
+        for first, second, _ in merges:
             root_first, root_second = find(first), find(second)
             if root_first != root_second:
                 parent[root_second] = root_first
@@ -472,9 +539,91 @@ class Agglomeration:
             result.append(mapping[root])
         return result
 
+    def labels(self, threshold: float) -> List[int]:
+        """Метки кластеров при разрезе дендрограммы на высоте ``threshold``.
+
+        Слияния выше порога не выполняются. Метки неотрицательны и нумеруются
+        в порядке появления; у элементов одного кластера метка совпадает.
+        """
+        return self._labels_from(
+            (first, second, height)
+            for first, second, height in self.merges
+            if height <= threshold + _HEIGHT_EPS
+        )
+
     def cluster_count(self, threshold: float) -> int:
         """Число кластеров при разрезе дендрограммы на высоте ``threshold``."""
         return len(set(self.labels(threshold)))
+
+    def cut_step(self, threshold: float) -> int:
+        """Номер шага, соответствующего разрезу дендрограммы по порогу.
+
+        Возвращает число слияний с высотой не выше ``threshold`` — ровно
+        столько шагов выполняет кластеризация «по порогу». Значение ``0``
+        означает, что порог меньше первого слияния, а ``len(self.merges)`` —
+        что порог не меньше последнего (весь процесс до одного кластера).
+        """
+        return sum(
+            1
+            for _, _, height in self.merges
+            if height <= threshold + _HEIGHT_EPS
+        )
+
+    def _validate_step(self, step: int) -> int:
+        """Проверить номер шага и вернуть его как целое."""
+        value = int(step)
+        if value < 0 or value > len(self.merges):
+            raise ValueError(
+                f"число шагов должно быть в диапазоне 0..{len(self.merges)}, "
+                f"получено {step!r}"
+            )
+        return value
+
+    def labels_after(self, step: int) -> List[int]:
+        """Метки кластеров после первых ``step`` слияний.
+
+        ``step = 0`` — исходное состояние (каждая величина — свой кластер),
+        ``step = len(merges)`` — всё слито в один кластер.
+        """
+        return self._labels_from(self.merges[: self._validate_step(step)])
+
+    def cluster_count_after(self, step: int) -> int:
+        """Число кластеров после первых ``step`` слияний."""
+        return self.size - self._validate_step(step)
+
+    def groups_after(self, step: int) -> List[List[int]]:
+        """Группы индексов величин после первых ``step`` слияний."""
+        return _group_by_labels(self.labels_after(step))
+
+    def steps(self) -> Tuple[Merge, ...]:
+        """Последовательность слияний с составом кластеров на каждом шаге.
+
+        Нужна для пошагового показа процесса: на каждом шаге видно, какие
+        исходные величины стоят за сливающимися кластерами.
+        """
+        members: Dict[int, Tuple[int, ...]] = {
+            index: (index,) for index in range(self.size)
+        }
+        result: List[Merge] = []
+        for step, (first, second, height) in enumerate(self.merges, start=1):
+            left = members.get(first)
+            right = members.get(second)
+            if left is None or right is None:  # защита от несогласованной трассы
+                continue
+            merged = tuple(sorted(left + right))
+            members[first] = merged
+            del members[second]
+            result.append(
+                Merge(
+                    step=step,
+                    left=left,
+                    right=right,
+                    height=height,
+                    cluster_count=self.size - step,
+                    members=merged,
+                )
+            )
+        return tuple(result)
 
 
 def _group_by_labels(labels: Sequence[int]) -> List[List[int]]:
@@ -535,6 +684,31 @@ def _agglomerate(
             heapq.heappush(heap, (new_value, key[0], key[1]))
 
     return list(clusters.values()), heights, merges
+
+
+def agglomerate(
+    variables: Iterable[object], *, metric: str = "hausdorff"
+) -> Agglomeration:
+    """Построить трассу агломеративной кластеризации (полная связь).
+
+    Возвращает :class:`Agglomeration` — полную последовательность слияний.
+    По ней можно получить разбиение при любом пороге
+    (:meth:`Agglomeration.labels`) или после любого числа шагов
+    (:meth:`Agglomeration.labels_after`), не пересчитывая матрицу расстояний.
+
+    Пример
+    ------
+    ::
+
+        trace = agglomerate(sample)
+        trace.cluster_count_after(0)   # 300 — все точки отдельно
+        trace.cluster_count_after(299) # 1   — всё слито
+    """
+    items = _as_items(variables)
+    if not items:
+        return Agglomeration(0, ())
+    _, _, merges = _agglomerate(items, get_distance_function(metric), None)
+    return Agglomeration(len(items), tuple(merges))
 
 
 def threshold_clustering(

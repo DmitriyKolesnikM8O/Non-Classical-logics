@@ -10,15 +10,45 @@ from fuzzy_core.clustering import (
     NOISE_LABEL,
     Agglomeration,
     AlphaClusterer,
+    agglomerate,
     alpha_cut_clustering,
     alpha_cut_profile,
     cluster,
     density_clustering,
+    grouped_result,
     kmeans,
     max_min_closure,
     similarity_matrix,
     threshold_clustering,
 )
+
+
+def test_aggregation_cut_step_matches_threshold_clustering():
+    from fuzzy_core import generate_sample, threshold_clustering
+    sample = generate_sample(60, seed=1, count_range=(60, 60))
+    trace = agglomerate(sample, metric="hausdorff")
+    for threshold in (0.1, 0.5, 1.0, 2.5, 5.0):
+        result = threshold_clustering(sample, threshold=threshold, metric="hausdorff")
+        step = trace.cut_step(threshold)
+        expected_clusters = len(result.clusters)
+        actual_clusters = len(trace.labels_after(step)) if step > 0 else len(sample)  # step=0 => size clusters
+        # cut_step даёт число слияний; число кластеров = size - step (для step>0)
+        if step > 0:
+            assert len(set(trace.labels_after(step))) == expected_clusters
+        else:
+            assert expected_clusters == len(sample) or step == 0
+
+
+def test_cut_step_is_monotonic():
+    from fuzzy_core import generate_sample
+    sample = generate_sample(60, seed=1, count_range=(60, 60))
+    trace = agglomerate(sample, metric="hausdorff")
+    values = [0.0, 0.1, 0.3, 0.5, 0.7, 1.0, 2.0, 10.0, 100.0]
+    steps = [trace.cut_step(t) for t in values]
+    assert steps == sorted(steps)
+    # При очень большом пороге все слияния выполняются — шаг = число слияний.
+    assert steps[-1] == len(trace.merges)  # 100.0 > max(height)
+    assert steps[0] <= len(trace.merges)
 
 
 def _partition(labels):
@@ -595,6 +625,94 @@ def test_agglomeration_all_identical_variables_collapse_at_zero():
     assert trace.cluster_count(0.0) == 1
     assert trace.cluster_count(1e-9) == 1
     assert len(set(trace.labels(0.0))) == 1
+
+
+def test_agglomeration_steps_describe_each_merge():
+    items = [V(0, 0), V(1, 1), V(10, 10)]
+    trace = agglomerate(items)
+    steps = trace.steps()
+
+    assert len(steps) == 2
+    assert [merge.step for merge in steps] == [1, 2]
+    assert steps[0].height == pytest.approx(1.0)
+    assert set(steps[0].members) == {0, 1}
+    assert steps[0].cluster_count == 2
+    assert steps[1].members == (0, 1, 2)
+    assert steps[1].member_count == 3
+    assert steps[1].cluster_count == 1
+    assert steps[0].describe().startswith("шаг 1")
+
+
+def test_agglomeration_labels_after_replays_merges():
+    items = list(generate_sample(40, seed=7, count_range=(40, 40)))
+    trace = agglomerate(items)
+
+    assert trace.labels_after(0) == list(range(len(items)))
+    assert trace.cluster_count_after(0) == len(items)
+    for step in range(len(trace.merges) + 1):
+        labels = trace.labels_after(step)
+        assert sorted(trace.groups_after(step), key=lambda group: group[0]) == _partition(labels)
+        assert trace.cluster_count_after(step) == len(set(labels))
+        assert trace.cluster_count_after(step) == len(items) - step
+    assert trace.cluster_count_after(len(trace.merges)) == 1
+
+
+def test_agglomeration_labels_after_equals_labels_at_merge_height():
+    items = [V(0, 0), V(1, 1), V(5, 5), V(20, 20)]
+    trace = agglomerate(items)
+    heights = list(trace.heights)
+    assert len(set(heights)) == len(heights)  # без равных высот, чтобы сравнение было точным
+    for step, height in enumerate(heights, start=1):
+        assert _partition(trace.labels_after(step)) == _partition(trace.labels(height))
+
+
+def test_agglomeration_labels_after_rejects_out_of_range():
+    trace = agglomerate([V(0, 0), V(1, 1)])
+    assert len(trace.merges) == 1
+    for bad in (-1, 2, 10):
+        with pytest.raises(ValueError):
+            trace.labels_after(bad)
+    assert trace.labels_after(1) == [0, 0]
+
+
+def test_agglomerate_matches_threshold_clustering():
+    items = list(generate_sample(25, seed=3, count_range=(25, 25)))
+    trace = agglomerate(items)
+    for threshold in (0.0, 0.5, 2.0, 1e9):
+        fresh = threshold_clustering(items, threshold=threshold)
+        assert _partition(trace.labels(threshold)) == _partition(fresh.labels)
+
+
+def test_agglomerate_on_empty_input():
+    trace = agglomerate([])
+    assert trace.size == 0
+    assert trace.merges == ()
+    assert trace.steps() == ()
+    assert trace.labels_after(0) == []
+
+
+def test_grouped_result_builds_clusters_from_labels():
+    items = [V(0, 0), V(1, 1), V(10, 10)]
+    result = grouped_result(
+        items, [0, 0, 1], method="threshold", metric="hausdorff", parameters={"step": 1}
+    )
+    assert len(result.clusters) == 2
+    assert result.method == "threshold"
+    assert result.parameters["step"] == 1
+    assert sorted(result.sizes) == [1, 2]
+
+
+def test_grouped_result_treats_noise_label_as_noise():
+    items = [V(0, 0), V(100, 100)]
+    result = grouped_result(items, [NOISE_LABEL, 0], method="density")
+    assert len(result.clusters) == 1
+    assert result.noise == [0]
+    assert result.labels[0] == NOISE_LABEL
+
+
+def test_grouped_result_rejects_length_mismatch():
+    with pytest.raises(ValueError):
+        grouped_result([V(0, 0), V(1, 1)], [0], method="threshold")
 
 
 def test_alpha_clusterer_on_empty_sample():

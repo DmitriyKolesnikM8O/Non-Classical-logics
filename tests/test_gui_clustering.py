@@ -288,6 +288,10 @@ def test_legend_lists_every_cluster_with_its_color(tab):
 
     assert len(result.clusters) > 10
     assert tab.legend_button.cget("text") == f"Показать легенду ({len(result.clusters)})"
+    # Пока панель скрыта, строки не строятся (экономия на перерисовке).
+    assert tab.legend_panel.item_count == 0
+
+    tab.toggle_legend()
     assert tab.legend_panel.item_count == len(result.clusters) + 1  # + центры
 
     colors = tab.plot.group_colors
@@ -307,6 +311,7 @@ def test_legend_mentions_noise(tab):
     assert len(result.clusters) == 0
     assert tab.plot.group_colors == {-1: "#7f7f7f"}
     assert tab.legend_button.cget("text") == "Показать легенду (1)"
+    tab.toggle_legend()
     texts = legend_texts(tab)
     assert "шум" in texts
 
@@ -739,3 +744,236 @@ def test_alpha_play_stops_when_switching_method(tab):
     tab.method_var.set(METHOD_KMEANS)
     tab._update_parameter_state()
     assert tab._playing is False
+
+
+# ----------------------------------------------------------------------
+# Пошаговая агломерация
+# ----------------------------------------------------------------------
+def select_threshold(tab):
+    tab.method_var.set(METHOD_THRESHOLD)
+    tab._update_parameter_state()
+
+
+def test_step_controls_disabled_for_non_threshold(tab):
+    assert str(tab.step_button.cget("state")) == "disabled"
+    assert str(tab.step_play_button.cget("state")) == "disabled"
+    assert str(tab.step_reset_button.cget("state")) == "disabled"
+    assert tab.step_agglomeration() is None
+
+
+def test_step_controls_enabled_for_threshold(tab):
+    select_threshold(tab)
+    for widget in (tab.step_button, tab.step_play_button, tab.step_reset_button):
+        assert str(widget.cget("state")) == "normal"
+
+
+def test_reset_shows_initial_state(tab, sample):
+    select_threshold(tab)
+    # С галочкой «на пороге» предел = cut_step, но при шаге 0 текст = 0/limit.
+    tab.step_stop_var.set(False)  # тестируем полный процесс, как раньше
+    trace = tab.reset_agglomeration()
+    assert tab.trace is trace
+    assert tab.step_index == 0
+    assert tab.step_label.cget("text") == f"шаг 0/{len(trace.merges)}"
+    # шагов не выполнено: кластеров нет, все точки отмечены как шум
+    assert tab.result is not None
+    assert len(tab.result.clusters) == 0
+    assert tab.result.noise == list(range(len(sample)))
+
+
+def test_step_agglomeration_decreases_cluster_count(tab, sample):
+    select_threshold(tab)
+    # Отключаем галочку «на пороге», чтобы тест проверял полный процесс.
+    tab.step_stop_var.set(False)
+    total = len(tab.get_trace(sample, "hausdorff").merges)
+    assert tab.step_agglomeration() == 1
+    assert tab.step_label.cget("text") == f"шаг 1/{total}"
+    counts = [len(tab.result.clusters)]
+    for _ in range(3):
+        tab.step_agglomeration()
+        counts.append(len(tab.result.clusters))
+    assert counts == sorted(counts, reverse=True)
+    assert counts[0] == len(sample) - 1
+
+
+def test_step_agglomeration_runs_to_single_cluster(tab, sample):
+    select_threshold(tab)
+    # Отключаем ограничение порогом, чтобы дойти до 1 кластера.
+    tab.step_stop_var.set(False)
+    trace = tab.get_trace(sample, "hausdorff")
+    for _ in range(len(trace.merges)):
+        assert tab.step_agglomeration() is not None
+    assert len(tab.result.clusters) == 1
+    assert tab.step_agglomeration() is None  # шагов больше нет
+
+
+def test_step_agglomeration_logs_each_merge(tab):
+    select_threshold(tab)
+    tab.step_agglomeration()
+    content = tab.logger.read()
+    assert "Агломерация" in content
+    assert "шаг 1" in content
+
+
+def test_step_agglomeration_requires_sample(tk_window, tmp_path):
+    logger = SessionLogger(tmp_path)
+    try:
+        widget = ClusteringTab(tk_window, logger, lambda: None)
+        widget.method_var.set(METHOD_THRESHOLD)
+        widget._update_parameter_state()
+        assert widget.step_agglomeration() is None
+        assert "Ошибка" in result_text(widget)
+    finally:
+        logger.close()
+
+
+def test_step_play_toggles_and_steps(tab):
+    select_threshold(tab)
+    tab.reset_agglomeration()
+    assert tab.toggle_step_play() is True
+    assert tab._step_playing is True
+    assert tab.step_play_button.cget("text") == "■"
+    assert tab.step_index == 1  # start уже сделал первый шаг
+    assert tab.toggle_step_play() is False
+    assert tab._step_playing is False
+    assert tab.step_play_button.cget("text") == "▶"
+
+
+def test_step_play_stops_when_switching_method(tab):
+    select_threshold(tab)
+    tab.start_step_play()
+    assert tab._step_playing is True
+    tab.method_var.set(METHOD_KMEANS)
+    tab._update_parameter_state()
+    assert tab._step_playing is False
+    assert tab.step_play_button.cget("text") == "▶"
+
+
+def test_step_play_restarts_after_finishing(tab, sample):
+    select_threshold(tab)
+    # Без ограничения порогом проигрывание доходит до конца и перезапускается.
+    tab.step_stop_var.set(False)
+    trace = tab.get_trace(sample, "hausdorff")
+    for _ in range(len(trace.merges)):
+        tab.step_agglomeration()
+    assert tab.step_index == len(trace.merges)
+    tab.start_step_play()
+    assert tab.step_index == 1  # дошли до конца — начали заново
+    tab.stop_step_play()
+
+
+def test_step_trace_cached_per_sample_and_metric(tab, sample):
+    select_threshold(tab)
+    first = tab.get_trace(sample, "hausdorff")
+    assert tab.get_trace(sample, "hausdorff") is first
+    assert tab.get_trace(sample, "euclidean") is not first
+
+
+def test_step_run_uses_threshold_result_and_keeps_steps(tab, sample):
+    select_threshold(tab)
+    tab.step_agglomeration()
+    assert tab.result is not None
+    assert tab.result.method == METHOD_THRESHOLD
+    assert tab.result.parameters["step"] == 1
+    assert tab.result.parameters["steps_total"] == len(sample) - 1
+
+
+def test_step_play_defers_tables_until_stop(tab, sample):
+    """Во время проигрывания таблицы не пересобираются — это дорого."""
+    select_threshold(tab)
+    tab.reset_agglomeration()
+    assert tab.cluster_table.row_count == 0  # шагов ещё нет
+
+    tab.start_step_play()
+    tab.step_agglomeration(update_tables=False)
+    tab.step_agglomeration(update_tables=False)
+
+    assert tab._step_playing is True
+    assert tab._step_ui_stale is True
+    assert len(tab.result.clusters) == len(sample) - 3
+    assert tab.cluster_table.row_count == 0  # таблица ждёт остановки
+
+    tab.stop_step_play()
+    assert tab._step_ui_stale is False
+    assert tab.cluster_table.row_count == len(sample) - 3
+    assert tab.point_table.row_count == len(sample)
+
+
+def test_step_play_refreshes_open_legend_on_stop(tab, sample):
+    select_threshold(tab)
+    tab.reset_agglomeration()
+    assert tab.toggle_legend() is True
+    assert tab.legend_panel.item_count == 2  # шум + центры
+
+    tab.start_step_play()
+    tab.step_agglomeration(update_tables=False)
+    assert tab.legend_panel.item_count == 2  # пока проигрываем — старая
+
+    tab.stop_step_play()
+    assert tab.legend_panel.item_count == len(sample) - 2 + 1  # кластеры + центры
+
+
+# ----------------------------------------------------------------------
+# Скорость пошагового проигрывания
+# ----------------------------------------------------------------------
+def test_step_speed_default(tab):
+    select_threshold(tab)
+    assert tab.step_speed_label.cget("text") == "2.5/с"
+    assert tab.step_interval_ms() == 400
+
+
+def test_step_speed_sets_interval(tab):
+    select_threshold(tab)
+    assert tab.set_step_speed(20) == pytest.approx(20.0)
+    assert tab.step_interval_ms() == 50
+    assert tab.step_speed_label.cget("text") == "20.0/с"
+    assert tab.set_step_speed(1) == pytest.approx(1.0)
+    assert tab.step_interval_ms() == 1000
+
+
+def test_step_speed_is_clamped(tab):
+    select_threshold(tab)
+    assert tab.set_step_speed(100) == pytest.approx(20.0)
+    assert tab.set_step_speed(0.1) == pytest.approx(1.0)
+
+
+def test_step_speed_disabled_for_non_threshold(tab):
+    assert str(tab.step_speed_scale.cget("state")) == "disabled"
+    select_threshold(tab)
+    assert str(tab.step_speed_scale.cget("state")) == "normal"
+
+
+def test_step_speed_reschedules_while_playing(tab):
+    select_threshold(tab)
+    tab.start_step_play()
+    assert tab._step_playing is True
+    assert tab._step_job is not None
+    tab.set_step_speed(20)
+    assert tab._step_playing is True
+    assert tab.step_interval_ms() == 50
+    tab.stop_step_play()
+
+
+def test_step_speed_does_not_schedule_when_idle(tab):
+    select_threshold(tab)
+    tab.set_step_speed(20)
+    assert tab._step_playing is False
+    assert tab._step_job is None
+
+
+def test_clustering_tab_left_panel_mousewheel(tab):
+    from types import SimpleNamespace
+    import tkinter as tk
+
+    assert isinstance(tab.panel_outer, tk.Canvas)
+    assert tab.panel_outer.bind("<MouseWheel>")
+    assert tab.panel_frame.bind("<MouseWheel>")
+    assert tab.run_button.bind("<MouseWheel>")
+    assert tab.sample_label.bind("<MouseWheel>")
+
+    assert tab._on_panel_mousewheel(SimpleNamespace(delta=-120)) == "break"
+    assert tab._on_panel_mousewheel(SimpleNamespace(delta=120)) == "break"
+    assert tab._on_panel_mousewheel(SimpleNamespace(num=4, delta=0)) == "break"
+    assert tab._on_panel_mousewheel(SimpleNamespace(num=5, delta=0)) == "break"
+    assert tab._on_panel_mousewheel(SimpleNamespace(num=0, delta=0)) == "break"
+

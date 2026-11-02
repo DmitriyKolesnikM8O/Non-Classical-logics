@@ -24,3 +24,8 @@
 - Kill hung or runaway tasks immediately.
 - Do not poll in tight loops.
 - Keep responses compact and immediate.
+
+## 5. Command Execution Discipline (THINK FIRST)
+- **Analyze Before Executing**: Always reason through code issues, type errors, and lints statically first.
+- **Zero Command Spam**: NEVER launch exploratory commands, environment probes, or iterative shell checks for trivial fixes that require user confirmation.
+- **Direct Action**: If a fix or answer is obvious from reading the code, apply the file edit directly or explain the solution immediately without touching the terminal.

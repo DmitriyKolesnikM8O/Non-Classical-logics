@@ -226,6 +226,23 @@ def test_scatter_legend_hidden_for_many_groups(tk_window):
     assert len(plot.group_colors) == 25
 
 
+def test_scatter_many_groups_use_single_collection(tk_window):
+    """Десятки кластеров рисуются одной коллекцией — иначе перерисовка медленная."""
+    plot = MembershipPlot(tk_window, toolbar=False)
+    groups = [index // 4 for index in range(4 * 25)]
+    plot.show_scatter([(float(i), float(i % 7)) for i in range(len(groups))], groups)
+
+    assert len(plot.axes.collections) == 1
+    assert plot.point_count == len(groups)
+    assert len(plot.group_colors) == 25
+
+
+def test_scatter_few_groups_use_one_collection_per_group(tk_window):
+    plot = MembershipPlot(tk_window, toolbar=False)
+    plot.show_scatter([(0.0, 1.0), (1.0, 1.0), (9.0, 1.0)], [0, 0, 1])
+    assert len(plot.axes.collections) == 2
+
+
 def test_scatter_shows_legend_for_few_groups(tk_window):
     plot = MembershipPlot(tk_window, toolbar=False)
     plot.show_scatter([(0.0, 1.0), (1.0, 1.0), (9.0, 1.0)], [0, 0, 1])

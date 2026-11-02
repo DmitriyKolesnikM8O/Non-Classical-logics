@@ -353,10 +353,13 @@ alpha_cut_profile(variables, alphas=None, *, metric="hausdorff", linkage="single
 similarity_matrix(variables, *, metric="hausdorff", scale=None)
 max_min_closure(similarity)
 density_clustering(variables, *, eps, min_points=2, metric="hausdorff")
+agglomerate(variables, *, metric="hausdorff")
+grouped_result(variables, labels, *, method, metric="hausdorff", parameters=None)
 cluster(variables, method="kmeans", *, metric="hausdorff", **parameters)
 
 AlphaClusterer(variables, *, metric="hausdorff", linkage="single", closure=True, scale=None)
 Agglomeration(size, merges=())
+Merge(step, left, right, height, cluster_count, members)
 ```
 
 **Общие соглашения**
@@ -379,9 +382,11 @@ Agglomeration(size, merges=())
 | `similarity_matrix` | матрица сходства `r_ij = 1 − d_ij/d0` со значениями из `[0, 1]`, `r_ii = 1` |
 | `max_min_closure` | max-min транзитивное замыкание матрицы сходства — нечёткое отношение эквивалентности |
 | `density_clustering` | `eps` — радиус окрестности, `min_points` — минимум точек в окрестности (включая саму точку) |
+| `agglomerate` | строит трассу агломерации полной связи (`Agglomeration`) для выборки — без разреза по порогу; удобно для пошагового просмотра |
+| `grouped_result` | собирает `ClusterResult` из готовых меток (например, разрез трассы на шаге `step`); метки `NOISE_LABEL` считаются шумом |
 | `cluster` | `method` — `"kmeans"`, `"threshold"`, `"alpha"` или `"density"`; остальные именованные аргументы передаются выбранному методу |
 | `AlphaClusterer` | движок α-кластеризации: матрица сходства считается при создании объекта, замыкание и трасса агломерации — лениво и однократно. Методы: `clustering(alpha, *, closure=None) -> ClusterResult`, `profile(alphas=None, *, closure=None) -> list`, свойства `size`, `scale`, `similarity`, `closed`, `trace` |
-| `Agglomeration` | трасса агломерации полной связи: `size` — число величин, `merges` — кортеж `(i, j, высота)`; свойства `heights`; методы `labels(threshold) -> list[int]`, `cluster_count(threshold) -> int` |
+| `Agglomeration` | трасса агломерации полной связи: `size` — число величин, `merges` — кортеж `(i, j, высота)`; свойства `heights`; методы `labels(threshold)`, `cluster_count(threshold)`, `cut_step(threshold)`, `labels_after(step)`, `cluster_count_after(step)`, `groups_after(step)`, `steps()` |
 
 **Ошибки**
 
@@ -445,6 +450,49 @@ engine.trace.labels((1 - 0.8) * engine.scale)          # метки класте
 свойство `trace` (трасса агломерации) — наоборот, нужно только для
 `linkage="complete"`. Разрез трассы по порогу `τ` эквивалентен
 `threshold_clustering(threshold=τ)`.
+
+**Пример: пошаговая агломерация**
+
+Трасса хранит процесс полностью, поэтому его можно «проиграть» слияние за
+слиянием, не пересчитывая матрицу расстояний.
+
+```python
+from fuzzy_core import agglomerate, grouped_result, generate_sample
+
+sample = generate_sample(40, seed=7)
+trace = agglomerate(sample)
+
+trace.size                       # 40
+len(trace.merges)                # 39 — столько слияний до одного кластера
+trace.cluster_count_after(0)     # 40 — все точки отдельно
+trace.labels_after(1)            # метки после первого слияния
+trace.groups_after(1)            # группы индексов после первого слияния
+
+for merge in trace.steps()[:3]:
+    merge.describe()             # 'шаг 1: слияние кластеров размерами 1 и 1 на расстоянии 0.0137'
+    merge.members                # исходные индексы объединённого кластера
+
+# результат на произвольном шаге собирается из меток
+result = grouped_result(sample, trace.labels_after(5), method="threshold",
+                        parameters={"step": 5})
+len(result.clusters)             # столько кластеров осталось после 5 слияний
+```
+
+Метод `labels_after(step)` — это разрез трассы после первых `step` слияний
+(`step = 0` — исходное состояние, `step = len(merges)` — один кластер); он
+согласован с разрезом по высоте: `labels_after(n)` совпадает с `labels(h_n)`.
+
+**Класс `Merge`** — одно слияние процесса.
+
+| Член | Описание |
+| --- | --- |
+| `step` | номер шага (с единицы) |
+| `left`, `right` | исходные индексы элементов двух сливающихся кластеров |
+| `height` | расстояние (высота дендрограммы) в момент слияния |
+| `cluster_count` | число кластеров после слияния |
+| `members` | объединённый состав кластера (все исходные индексы) |
+| `member_count` | число элементов в объединённом кластере |
+| `describe()` | короткое описание шага для журнала и подписи |
 
 **Класс `Cluster`** — один кластер.
 
@@ -659,7 +707,7 @@ FuzzyApp(master=None, *, logger=None, log_dir=None)
 | --- | --- |
 | `ArithmeticTab(master, logger, *, on_message=None)` | `compute(operation)`, `compare()`, `variable_a()`, `variable_b()`, `clear_protocol()` |
 | `GenerationTab(master, logger, *, on_message=None, on_sample=None)` | `read_parameters()`, `read_seed()`, `generate()`, `fill_table()`, `clear()` |
-| `ClusteringTab(master, logger, sample_provider, *, on_message=None, on_result=None)` | `run()`, `read_parameters(method=None)`, `read_seed()`, `show_plot()`, `fill_tables()`, `toggle_legend()`, `refresh_legend()`, `refresh_sample_info()`, `on_tab_activated()`. Для интерактивного α: `get_engine(sample, metric, linkage)`, `set_alpha_value(value, *, recompute=True)`, `apply_alpha_change()`, `show_profile_plot()`, `show_matrix_plot(engine, result)`, `toggle_alpha_play()`, `start_alpha_play()`, `stop_alpha_play()`, `advance_alpha_play()`, `_sync_view_tabs()`; свойства `engine`, `profile`. Закладки «Профиль k(α)» и «Матрица сходства» активны только для метода α-уровня, у остальных методов отключены |
+| `ClusteringTab(master, logger, sample_provider, *, on_message=None, on_result=None)` | `run()`, `read_parameters(method=None)`, `read_seed()`, `show_plot(title=None)`, `fill_tables()`, `toggle_legend()`, `refresh_legend()`, `refresh_sample_info()`, `on_tab_activated()`. Для интерактивного α: `get_engine(sample, metric, linkage)`, `set_alpha_value(value, *, recompute=True)`, `apply_alpha_change()`, `show_profile_plot()`, `show_matrix_plot(engine, result)`, `toggle_alpha_play()`, `start_alpha_play()`, `stop_alpha_play()`, `advance_alpha_play()`, `_sync_view_tabs()`; свойства `engine`, `profile`. Закладки «Профиль k(α)» и «Матрица сходства» активны только для метода α-уровня, у остальных методов отключены. Для пошаговой агломерации (метод «по порогу»): `get_trace(sample, metric)`, `step_agglomeration()`, `reset_agglomeration()`, `toggle_step_play()`, `start_step_play()`, `stop_step_play()`, `set_step_speed(speed, *, reschedule=True)`, `step_interval_ms()`; свойства `trace`, `step_index`, `step_speed_scale` |
 | `LogTab(master, logger, *, on_message=None, autoupdate_ms=2000)` | `reload()`, `save_as()`, `save_to(path)`, `on_tab_activated()`, `autoupdate_active` |
 
 Константы: `APP_TITLE`, `WINDOW_SIZE = (1180, 780)`, `TAB_TITLES`,
