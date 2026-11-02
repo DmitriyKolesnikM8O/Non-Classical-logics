@@ -22,3 +22,6 @@ logs/*.log
 .vscode/
 Thumbs.db
 desktop.ini
+
+# Временные файлы Office (блокировка открытого документа)
+~$*

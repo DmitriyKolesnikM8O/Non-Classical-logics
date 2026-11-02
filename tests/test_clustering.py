@@ -8,6 +8,8 @@ from fuzzy_core import FuzzySet, UniformFuzzyVariable as V, generate_sample
 from fuzzy_core.clustering import (
     CLUSTERING_METHODS,
     NOISE_LABEL,
+    Agglomeration,
+    AlphaClusterer,
     alpha_cut_clustering,
     alpha_cut_profile,
     cluster,
@@ -17,6 +19,14 @@ from fuzzy_core.clustering import (
     similarity_matrix,
     threshold_clustering,
 )
+
+
+def _partition(labels):
+    """Разбиение в виде отсортированного списка групп индексов."""
+    return sorted(
+        sorted(i for i, value in enumerate(labels) if value == label)
+        for label in set(labels)
+    )
 
 
 def three_groups():
@@ -503,3 +513,116 @@ def test_alpha_via_unified_entry_point_records_parameters():
     assert result.parameters["alpha"] == 0.8
     assert result.parameters["linkage"] == "complete"
     assert result.to_dict()["cluster_count"] == len(result.clusters)
+
+
+# ======================================================================
+# Движок α-кластеризации и трасса агломерации (интерактивный режим)
+# ======================================================================
+@pytest.mark.parametrize("linkage", ["single", "complete"])
+def test_alpha_clusterer_matches_module_functions(linkage):
+    items = list(generate_sample(120, seed=2026, count_range=(120, 120)))
+    engine = AlphaClusterer(items, linkage=linkage)
+    for alpha in (1.0, 0.9, 0.7, 0.4):
+        by_engine = engine.clustering(alpha)
+        by_module = alpha_cut_clustering(items, alpha=alpha, linkage=linkage)
+        assert by_engine.sizes == by_module.sizes
+        assert _partition(by_engine.labels) == _partition(by_module.labels)
+
+
+@pytest.mark.parametrize("linkage", ["single", "complete"])
+def test_alpha_clusterer_profile_matches_module_function(linkage):
+    items = list(generate_sample(80, seed=7, count_range=(80, 80)))
+    levels = [1.0, 0.9, 0.5, 0.1]
+    engine = AlphaClusterer(items, linkage=linkage)
+    assert engine.profile(levels) == alpha_cut_profile(items, levels, linkage=linkage)
+
+
+def test_alpha_clusterer_scale_matches_module():
+    items = list(generate_sample(60, seed=11, count_range=(60, 60)))
+    engine = AlphaClusterer(items)
+    direct = alpha_cut_clustering(items, alpha=0.5)
+    assert engine.scale == pytest.approx(direct.parameters["distance_scale"])
+
+
+def test_alpha_clusterer_complete_closure_is_not_computed():
+    items = list(generate_sample(40, seed=3, count_range=(40, 40)))
+    engine = AlphaClusterer(items, linkage="complete")
+    # Полной связи замыкание не нужно — свойство не должно его считать.
+    assert engine.clustering(0.5)
+    assert engine._closed is None  # noqa: SLF001 — проверка ленивой инициализации
+
+
+def test_alpha_clusterer_lazy_properties_are_cached():
+    items = list(generate_sample(30, seed=5, count_range=(30, 30)))
+    engine = AlphaClusterer(items, linkage="single")
+    first_closure = engine.closed
+    assert engine.closed is first_closure
+    trace = engine.trace
+    assert engine.trace is trace
+    assert trace.size == len(items)
+
+
+def test_alpha_clusterer_exposes_similarity_copy():
+    items = list(generate_sample(20, seed=9, count_range=(20, 20)))
+    engine = AlphaClusterer(items)
+    matrix = engine.similarity
+    matrix[0][0] = -1.0  # копия: внутренняя матрица не портится
+    assert engine.similarity[0][0] == pytest.approx(1.0)
+
+
+def test_agglomeration_labels_match_threshold_clustering():
+    items = list(generate_sample(50, seed=2026, count_range=(50, 50)))
+    engine = AlphaClusterer(items, linkage="complete")
+    trace = engine.trace
+    for alpha in (1.0, 0.9, 0.6, 0.3):
+        threshold = (1.0 - alpha) * engine.scale
+        fresh = threshold_clustering(items, threshold=threshold)
+        assert _partition(trace.labels(threshold)) == _partition(fresh.labels)
+        assert trace.cluster_count(threshold) == len(fresh.clusters)
+
+
+def test_agglomeration_heights_are_merges_order():
+    items = [V(0, 0), V(1, 1), V(10, 10)]
+    trace = AlphaClusterer(items, linkage="complete").trace
+    assert trace.size == 3
+    assert len(trace.merges) == 2
+    assert trace.heights == tuple(height for _, _, height in trace.merges)
+    assert list(trace.heights) == sorted(trace.heights)
+
+
+def test_agglomeration_all_identical_variables_collapse_at_zero():
+    trace = AlphaClusterer([V(1, 2)] * 5, linkage="complete").trace
+    assert trace.cluster_count(0.0) == 1
+    assert trace.cluster_count(1e-9) == 1
+    assert len(set(trace.labels(0.0))) == 1
+
+
+def test_alpha_clusterer_on_empty_sample():
+    engine = AlphaClusterer([], linkage="complete")
+    assert engine.size == 0
+    assert engine.similarity == []
+    assert engine.clustering(0.5).clusters == []
+    assert engine.profile([0.5]) == [{"alpha": 0.5, "cluster_count": 0}]
+    assert engine.trace.size == 0
+
+
+def test_alpha_clusterer_rejects_bad_arguments():
+    items = [V(0, 0), V(1, 1)]
+    for bad in (0.0, -0.5, 1.5, float("nan")):
+        with pytest.raises(ValueError):
+            AlphaClusterer(items).clustering(bad)
+    with pytest.raises(ValueError):
+        AlphaClusterer(items, linkage="average")
+    with pytest.raises(ValueError):
+        AlphaClusterer(items, metric="manhattan")
+    with pytest.raises(ValueError):
+        AlphaClusterer(items, scale=0.0)
+    with pytest.raises(ValueError):
+        AlphaClusterer(items, scale=-3.0)
+
+
+def test_alpha_clusterer_closure_flag_can_be_overridden_per_call():
+    items = [V(0, 0), V(5, 5), V(10, 10)]
+    engine = AlphaClusterer(items, linkage="single", closure=False)
+    assert engine.clustering(1.0).parameters["closure"] is False
+    assert engine.clustering(1.0, closure=True).parameters["closure"] is True

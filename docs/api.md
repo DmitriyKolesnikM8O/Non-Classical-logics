@@ -87,7 +87,7 @@ with SessionLogger(log_dir="logs") as log:
 
 | Исключение | Базовый класс | Когда возбуждается |
 | --- | --- | --- |
-| `FuzzyVariableError` | `ValueError` | неверные границы величины, деление на интервал с нулём |
+| `FuzzyVariableError` | `ValueError` | неверные границы величины или параметры α-среза, деление на интервал с нулём |
 | `FuzzySetError` | `ValueError` | некорректные операции над множеством величин |
 
 Так как оба класса наследуют `ValueError`, достаточно перехватывать
@@ -188,6 +188,35 @@ try:
     a / V(-1, 1)
 except Exception as exc:
     print(exc)   # Деление невозможно: интервал делителя [-1, 1] содержит 0
+```
+
+**α-срезы других форм функции принадлежности.** Модульные функции (экспортируются
+из `fuzzy_core`):
+
+```python
+alpha_cut_trapezoid(a, c, d, b, alpha=1.0) -> tuple
+alpha_cut_triangular(a, m, b, alpha=1.0) -> tuple
+```
+
+| Функция | Описание |
+| --- | --- |
+| `alpha_cut_trapezoid` | α-срез трапеции `T(a, c, d, b)`: `(a + α(c − a), b − α(b − d))`; при `α = 1` — плато `(c, d)`, при `α > 1` — `()` |
+| `alpha_cut_triangular` | α-срез треугольника `T(a, m, b)` — частный случай трапеции при `c = d = m`: `(a + α(m − a), b − α(b − m))` |
+
+Требуется `a ≤ c ≤ d ≤ b` (для треугольника `a ≤ m ≤ b`), все параметры должны
+быть конечными, `0 < alpha ≤ 1`; иначе возбуждается `FuzzyVariableError`.
+Равномерная величина варианта 1 — вырожденная трапеция с `c = a`, `d = b`,
+поэтому `alpha_cut_trapezoid(a, a, b, b, α) == (a, b)` при любом `α` — то же
+самое, что `UniformFuzzyVariable.alpha_cut(α)`.
+
+```python
+from fuzzy_core import alpha_cut_triangular, alpha_cut_trapezoid, UniformFuzzyVariable as V
+
+alpha_cut_triangular(0, 5, 10, 0.5)      # (2.5, 7.5)
+alpha_cut_triangular(0, 5, 10, 1.0)      # (5.0, 5.0)
+alpha_cut_trapezoid(0, 2, 8, 10, 0.5)    # (1.0, 9.0)
+alpha_cut_trapezoid(1, 1, 3, 3, 0.7)     # (1.0, 3.0) — вырожденная трапеция
+V(1, 3).alpha_cut(0.7)                   # (1.0, 3.0)
 ```
 
 ### 3.3. Класс `FuzzySet`
@@ -325,6 +354,9 @@ similarity_matrix(variables, *, metric="hausdorff", scale=None)
 max_min_closure(similarity)
 density_clustering(variables, *, eps, min_points=2, metric="hausdorff")
 cluster(variables, method="kmeans", *, metric="hausdorff", **parameters)
+
+AlphaClusterer(variables, *, metric="hausdorff", linkage="single", closure=True, scale=None)
+Agglomeration(size, merges=())
 ```
 
 **Общие соглашения**
@@ -348,6 +380,8 @@ cluster(variables, method="kmeans", *, metric="hausdorff", **parameters)
 | `max_min_closure` | max-min транзитивное замыкание матрицы сходства — нечёткое отношение эквивалентности |
 | `density_clustering` | `eps` — радиус окрестности, `min_points` — минимум точек в окрестности (включая саму точку) |
 | `cluster` | `method` — `"kmeans"`, `"threshold"`, `"alpha"` или `"density"`; остальные именованные аргументы передаются выбранному методу |
+| `AlphaClusterer` | движок α-кластеризации: матрица сходства считается при создании объекта, замыкание и трасса агломерации — лениво и однократно. Методы: `clustering(alpha, *, closure=None) -> ClusterResult`, `profile(alphas=None, *, closure=None) -> list`, свойства `size`, `scale`, `similarity`, `closed`, `trace` |
+| `Agglomeration` | трасса агломерации полной связи: `size` — число величин, `merges` — кортеж `(i, j, высота)`; свойства `heights`; методы `labels(threshold) -> list[int]`, `cluster_count(threshold) -> int` |
 
 **Ошибки**
 
@@ -385,6 +419,32 @@ result.parameters               # {'alpha': 0.7, 'linkage': 'complete', 'closure
 
 Число кластеров не убывает с ростом `alpha`: `alpha = 1` оставляет только
 совпадающие величины, малое `alpha` сливает всё в один кластер.
+
+**Пример: перебор уровней без повторных вычислений (движок `AlphaClusterer`)**
+
+Движок нужен там, где уровень перебирается многократно (ползунок α в интерфейсе,
+анимация): тяжёлые матрицы считаются один раз, а каждый следующий уровень стоит
+доли миллисекунды.
+
+```python
+from fuzzy_core import AlphaClusterer, generate_sample
+
+sample = generate_sample(300, seed=42)
+engine = AlphaClusterer(sample, linkage="complete")
+
+engine.clustering(0.8).sizes        # кластеры при α = 0.8
+engine.profile([1.0, 0.8, 0.5])     # [{'alpha': 1.0, 'cluster_count': 300}, ...]
+engine.similarity                   # матрица сходства r_ij (копия)
+engine.trace.cluster_count((1 - 0.8) * engine.scale)   # 9
+engine.trace.labels((1 - 0.8) * engine.scale)          # метки кластеров
+```
+
+`AlphaClusterer.clustering(alpha)` и `AlphaClusterer.profile(...)` дают ровно те же
+результаты, что `alpha_cut_clustering` / `alpha_cut_profile`. Свойство `closed`
+(замыкание) считается при первом обращении и не нужно при `linkage="complete"`;
+свойство `trace` (трасса агломерации) — наоборот, нужно только для
+`linkage="complete"`. Разрез трассы по порогу `τ` эквивалентен
+`threshold_clustering(threshold=τ)`.
 
 **Класс `Cluster`** — один кластер.
 
@@ -524,6 +584,8 @@ MembershipPlot(master, *, width=6.4, height=4.4, dpi=100, toolbar=True,
 | --- | --- |
 | `show_variables(variables, labels=None, *, title=None, pad=1.0, show_center=True, max_legend_items=10)` | рисует функции принадлежности; при числе кривых больше `max_legend_items` легенда на графике не рисуется |
 | `show_scatter(points, groups, *, centroids=(), title=None, xlabel="центр c", ylabel="ширина w", max_legend_items=10)` | диаграмма рассеяния точек `(c, w)` с раскраской по номерам кластеров (`-1` — шум); центроиды рисуются ромбами |
+| `show_alpha_profile(profile, *, current=None, title=None, xlabel="уровень отбора α", ylabel="число кластеров k(α)")` | кривая-ступенька `k(α)` по списку `{"alpha", "cluster_count"}`; `current` отмечает текущий уровень α вертикальной линией |
+| `show_similarity_matrix(matrix, *, alpha=None, order=None, labels=None, title=None)` | тепловая карта матрицы сходства: `order` переставляет строки и столбцы (кластеры — блоками на диагонали), `labels` рисует границы блоков, клетки `r_ij ≥ alpha` подсвечиваются. `ValueError`, если матрица не квадратная или `order` не перестановка |
 | `reset(title=None)` | очистить график |
 | `redraw()` | перерисовать холст |
 | `save(path, *, dpi=150)` | сохранить рисунок в файл |
@@ -531,6 +593,8 @@ MembershipPlot(master, *, width=6.4, height=4.4, dpi=100, toolbar=True,
 | `curve_count`, `labels`, `x_limits` | число кривых, подписи, границы по оси X |
 | `point_count`, `group_count`, `centroid_count` | число точек, групп и центроидов на диаграмме рассеяния |
 | `group_colors`, `group_sizes` | цвета и размеры групп |
+| `profile_points`, `current_alpha` | точки кривой `k(α)` (по возрастанию уровня) и отмеченный α |
+| `matrix_size`, `matrix_alpha`, `matrix_order`, `matrix_values` | размер и уровень подсветки матрицы, порядок индексов и матрица в показанном виде |
 
 Дополнительно: `distinct_colors(count)` — список различимых цветов (до 8 групп —
 фиксированная палитра `COLORS`, дальше цвета строятся по кругу оттенков с шагом
@@ -595,7 +659,7 @@ FuzzyApp(master=None, *, logger=None, log_dir=None)
 | --- | --- |
 | `ArithmeticTab(master, logger, *, on_message=None)` | `compute(operation)`, `compare()`, `variable_a()`, `variable_b()`, `clear_protocol()` |
 | `GenerationTab(master, logger, *, on_message=None, on_sample=None)` | `read_parameters()`, `read_seed()`, `generate()`, `fill_table()`, `clear()` |
-| `ClusteringTab(master, logger, sample_provider, *, on_message=None, on_result=None)` | `run()`, `read_parameters(method=None)`, `read_seed()`, `show_plot()`, `fill_tables()`, `toggle_legend()`, `refresh_legend()`, `refresh_sample_info()`, `on_tab_activated()` |
+| `ClusteringTab(master, logger, sample_provider, *, on_message=None, on_result=None)` | `run()`, `read_parameters(method=None)`, `read_seed()`, `show_plot()`, `fill_tables()`, `toggle_legend()`, `refresh_legend()`, `refresh_sample_info()`, `on_tab_activated()`. Для интерактивного α: `get_engine(sample, metric, linkage)`, `set_alpha_value(value, *, recompute=True)`, `apply_alpha_change()`, `show_profile_plot()`, `show_matrix_plot(engine, result)`, `toggle_alpha_play()`, `start_alpha_play()`, `stop_alpha_play()`, `advance_alpha_play()`, `_sync_view_tabs()`; свойства `engine`, `profile`. Закладки «Профиль k(α)» и «Матрица сходства» активны только для метода α-уровня, у остальных методов отключены |
 | `LogTab(master, logger, *, on_message=None, autoupdate_ms=2000)` | `reload()`, `save_as()`, `save_to(path)`, `on_tab_activated()`, `autoupdate_active` |
 
 Константы: `APP_TITLE`, `WINDOW_SIZE = (1180, 780)`, `TAB_TITLES`,

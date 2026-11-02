@@ -18,14 +18,15 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import fuzzy_core
 from fuzzy_core import (
+    DEFAULT_ALPHA_GRID,
     DISTANCE_METRICS,
     MAX_COUNT,
     MIN_COUNT,
     NOISE_LABEL,
+    AlphaClusterer,
     ClusterResult,
     FuzzySet,
     UniformFuzzyVariable,
-    alpha_cut_profile,
     cluster,
     generate_sample,
     get_distance_function,
@@ -872,6 +873,12 @@ POINT_COLUMNS: Sequence[Tuple[str, str, int]] = (
 #: Сколько размеров кластеров показывать в итоговой сводке.
 MAX_SIZES_IN_SUMMARY = 12
 
+#: Границы ползунка α-уровня, задержка пересчёта и шаг «проигрывания».
+ALPHA_MIN = 0.05
+ALPHA_MAX = 1.0
+ALPHA_DEBOUNCE_MS = 90
+ALPHA_PLAY_INTERVAL_MS = 600
+
 
 class ClusteringTab(ttk.Frame):
     """Кластерный анализ сгенерированной выборки.
@@ -900,6 +907,17 @@ class ClusteringTab(ttk.Frame):
         self.on_result: Callable[[object], None] = on_result or (lambda result: None)
         self.result: Optional[ClusterResult] = None
         self.profile: List[Dict[str, object]] = []
+
+        # Интерактивный α-уровень: движок кэшируется по (выборка, метрика, связь).
+        self.engine: Optional[AlphaClusterer] = None
+        self._engine_key: Optional[Tuple[int, str, str]] = None
+        self._alpha_job: Optional[str] = None
+        self._syncing_alpha = False
+        self._playing = False
+        self._play_job: Optional[str] = None
+        self._play_levels: List[float] = []
+        self._play_index = 0
+        self._stale_views: set = set()
 
         self.rowconfigure(1, weight=1)
         self.columnconfigure(1, weight=1)
@@ -991,6 +1009,30 @@ class ClusteringTab(ttk.Frame):
         self.eps_entry.grid_configure(row=3)
         self.min_points_entry.grid_configure(row=4)
 
+        # Интерактивный α: ползунок, текущее значение и кнопка «проигрывания».
+        # Всё в одной строке, чтобы левый столбец не вылезал за окно.
+        slider_row = ttk.Frame(parameters)
+        slider_row.grid(row=5, column=0, sticky="ew", pady=(4, 1))
+        self.alpha_value_label = ttk.Label(
+            slider_row, text=self._alpha_text(0.7), font=TEXT_FONT
+        )
+        self.alpha_value_label.pack(side="left")
+        self.alpha_scale = ttk.Scale(
+            slider_row,
+            from_=ALPHA_MAX,
+            to=ALPHA_MIN,
+            orient="horizontal",
+            length=104,
+            command=self._on_alpha_scale,
+        )
+        self.alpha_scale.set(0.7)
+        self.alpha_scale.pack(side="left", padx=(6, 0))
+        self.play_button = ttk.Button(
+            slider_row, text="▶", width=3, command=self.toggle_alpha_play
+        )
+        self.play_button.pack(side="left", padx=(4, 0))
+
+        # Смена способа построения графика: диаграмма / профиль k(α) / матрица.
         self.parameter_entries = {
             METHOD_KMEANS: (self.k_entry,),
             METHOD_THRESHOLD: (self.threshold_entry,),
@@ -1034,11 +1076,39 @@ class ClusteringTab(ttk.Frame):
         self.plot_area = ttk.PanedWindow(self.paned, orient="horizontal")
         self.paned.add(self.plot_area, weight=3)
 
-        self.plot = MembershipPlot(self.plot_area, height=3.4, toolbar=False)
-        self.plot_area.add(self.plot, weight=4)
+        # Три представления результата в одной вкладке-блокноте: привычная
+        # диаграмма, профиль k(α) и тепловая карта матрицы сходства.
+        self.view_notebook = ttk.Notebook(self.plot_area)
+        self.plot_area.add(self.view_notebook, weight=4)
+
+        self.plot = MembershipPlot(self.view_notebook, height=3.4, toolbar=False)
+        self.profile_plot = MembershipPlot(self.view_notebook, height=3.4, toolbar=False)
+        self.matrix_plot = MembershipPlot(self.view_notebook, height=3.4, toolbar=False)
+        self.view_notebook.add(self.plot, text="Диаграмма")
+        self.view_notebook.add(self.profile_plot, text="Профиль k(α)")
+        self.view_notebook.add(self.matrix_plot, text="Матрица сходства")
+        # Пустые профиль и матрица задают корректные подписи осей сразу.
+        self.profile_plot.show_alpha_profile([])
+        self.matrix_plot.show_similarity_matrix([])
+        self.view_notebook.bind("<<NotebookTabChanged>>", self._on_view_changed)
+        self._sync_view_tabs()
 
         self.legend_panel = LegendPanel(self.plot_area)
         self.legend_visible = False
+
+    def _sync_view_tabs(self) -> None:
+        """Разрешить закладки профиля и матрицы только для метода α-уровня.
+
+        Для остальных методов это представления «не применимы», поэтому они
+        отключаются: закладку нельзя выбрать. Если открыта отключаемая
+        закладка — переключаемся на «Диаграмму».
+        """
+        enabled = self.method_var.get() == METHOD_ALPHA
+        state = "normal" if enabled else "disabled"
+        for index in (1, 2):  # «Профиль k(α)», «Матрица сходства»
+            self.view_notebook.tab(index, state=state)
+        if not enabled and self.view_notebook.index("current") in (1, 2):
+            self.view_notebook.select(0)
 
     def _build_tables(self) -> None:
         self.table_notebook = ttk.Notebook(self.paned)
@@ -1149,6 +1219,14 @@ class ClusteringTab(ttk.Frame):
         )
         is_alpha = method == METHOD_ALPHA
         self.linkage_box.configure(state="readonly" if is_alpha else "disabled")
+        self.alpha_scale.configure(state="normal" if is_alpha else "disabled")
+        self.play_button.configure(state="normal" if is_alpha else "disabled")
+        if not is_alpha:
+            self.stop_alpha_play()
+        # Профиль и матрица относятся только к α-уровню; до создания блокнота
+        # (в _build_controls) синхронизация ещё невозможна.
+        if hasattr(self, "view_notebook"):
+            self._sync_view_tabs()
 
     # ------------------------------------------------------------------
     # Запуск анализа
@@ -1207,27 +1285,17 @@ class ClusteringTab(ttk.Frame):
             metric = self.metric_var.get()
             get_distance_function(metric)  # проверка имени метрики
             parameters = self.read_parameters(method)
-            result = cluster(sample, method, metric=metric, **parameters)
+            engine: Optional[AlphaClusterer] = None
+            if method == METHOD_ALPHA:
+                engine = self.get_engine(sample, metric, parameters["linkage"])
+                result = engine.clustering(parameters["alpha"])
+            else:
+                result = cluster(sample, method, metric=metric, **parameters)
         except (ValueError, TypeError) as exc:
             self._report_error("Кластерный анализ", exc)
             return None
 
-        self.result = result
-        self.fill_tables()
-        self.show_plot()
-        self.profile = []
-        if method == METHOD_ALPHA:
-            try:
-                self.profile = alpha_cut_profile(
-                    sample,
-                    metric=metric,
-                    linkage=result.parameters.get("linkage", "complete"),
-                )
-            except (ValueError, TypeError):
-                self.profile = []
-        self.result_label.configure(text=self._summary_text(), foreground=OK_COLOR)
-        self.refresh_legend()
-        self.logger.log_clustering(result)
+        self._present_result(result, engine, log=True)
         seed = parameters.get("seed")
         self.on_message(
             f"Кластеризация ({METHOD_LABELS[method]}): кластеров {len(result.clusters)}"
@@ -1235,6 +1303,224 @@ class ClusteringTab(ttk.Frame):
         )
         self.on_result(result)
         return result
+
+    #: Имена представлений результата в порядке закладок блокнота.
+    VIEW_NAMES: Tuple[str, ...] = ("scatter", "profile", "matrix")
+
+    def _present_result(
+        self,
+        result: ClusterResult,
+        engine: Optional[AlphaClusterer],
+        *,
+        log: bool,
+    ) -> None:
+        """Показать результат: таблицы, диаграммы, сводка, легенда.
+
+        При явном расчёте (``log=True``) обновляются все три представления.
+        При живой перестройке по ползунку α рисуется только видимая закладка,
+        остальные помечаются устаревшими и обновляются при переключении —
+        иначе каждый сдвиг ползунка перерисовывал бы три фигуры сразу.
+        """
+        self.result = result
+        self.fill_tables()
+        self.profile = []
+        if result.method == METHOD_ALPHA and engine is not None:
+            self.profile = engine.profile(DEFAULT_ALPHA_GRID)
+            views = {
+                "scatter": self.show_plot,
+                "profile": self.show_profile_plot,
+                "matrix": lambda: self.show_matrix_plot(engine, result),
+            }
+        else:
+            views = {
+                "scatter": self.show_plot,
+                "profile": lambda: self.profile_plot.show_alpha_profile([]),
+                "matrix": lambda: self.matrix_plot.show_similarity_matrix([]),
+            }
+
+        active = self.view_notebook.index("current")
+        self._stale_views: set = set()
+        for index, name in enumerate(self.VIEW_NAMES):
+            if log or index == active:
+                views[name]()
+            else:
+                self._stale_views.add(name)
+
+        self.result_label.configure(
+            text=self._summary_text(include_silhouette=log), foreground=OK_COLOR
+        )
+        self.refresh_legend()
+        if log:
+            self.logger.log_clustering(result)
+
+    def _on_view_changed(self, event: object = None) -> None:
+        """Обновить представление, отложенное во время живой перестройки."""
+        if not self._stale_views:
+            return
+        active = self.view_notebook.index("current")
+        name = self.VIEW_NAMES[active]
+        if name not in self._stale_views:
+            return
+        self._stale_views.discard(name)
+        if name == "scatter":
+            self.show_plot()
+        elif name == "profile":
+            self.show_profile_plot()
+        elif name == "matrix" and self.engine is not None and self.result is not None:
+            self.show_matrix_plot(self.engine, self.result)
+
+    # ------------------------------------------------------------------
+    # Интерактивный α-уровень
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _alpha_text(value: float) -> str:
+        """Подпись текущего α под ползунком."""
+        return f"α = {float(value):.2f}"
+
+    def get_engine(
+        self, sample: FuzzySet, metric: str, linkage: str
+    ) -> AlphaClusterer:
+        """Кэшированный движок α-кластеризации для текущей выборки и настроек.
+
+        Тяжёлые матрицы (расстояний, сходства, замыкание, трасса агломерации)
+        считаются один раз на комбинацию «выборка + метрика + связь», поэтому
+        ползунок α пересчитывает кластеры за доли миллисекунды.
+        """
+        key = (id(sample), metric, linkage)
+        if self.engine is None or self._engine_key != key:
+            self.engine = AlphaClusterer(sample, metric=metric, linkage=linkage)
+            self._engine_key = key
+        return self.engine
+
+    def _on_alpha_scale(self, value: object) -> None:
+        """Ползунок α сдвинулся: обновить подписи и запланировать пересчёт."""
+        if self._syncing_alpha:
+            return
+        level = float(value)
+        self.alpha_entry.set(f"{level:.2f}")
+        self.alpha_value_label.configure(text=self._alpha_text(level))
+        self._schedule_alpha_recompute()
+
+    def _schedule_alpha_recompute(self) -> None:
+        """Пересчитать кластеры после паузы (движения ползунка объединяются)."""
+        if self._alpha_job is not None:
+            self.after_cancel(self._alpha_job)
+        self._alpha_job = self.after(ALPHA_DEBOUNCE_MS, self.apply_alpha_change)
+
+    def set_alpha_value(self, value: float, *, recompute: bool = True) -> float:
+        """Задать α в ползунке и поле ввода (без обратного вызова ползунка)."""
+        level = min(ALPHA_MAX, max(ALPHA_MIN, float(value)))
+        self._syncing_alpha = True
+        try:
+            self.alpha_scale.set(level)
+        finally:
+            self._syncing_alpha = False
+        self.alpha_entry.set(f"{level:.2f}")
+        self.alpha_value_label.configure(text=self._alpha_text(level))
+        if recompute:
+            self.apply_alpha_change()
+        return level
+
+    def apply_alpha_change(self) -> Optional[ClusterResult]:
+        """Пересчитать кластеры по текущему α (без записи в журнал).
+
+        Возвращает результат или ``None``, если метод не α-уровень или выборки
+        нет. Публичный метод: его вызывают и отложенный пересчёт, и тесты.
+        """
+        self._alpha_job = None
+        if self.method_var.get() != METHOD_ALPHA:
+            return None
+        sample = self.current_sample()
+        if sample is None or len(sample) == 0:
+            return None
+        try:
+            alpha = float(self.alpha_entry.number())
+            metric = self.metric_var.get()
+            linkage = self.read_linkage()
+            engine = self.get_engine(sample, metric, linkage)
+            result = engine.clustering(alpha)
+        except (ValueError, TypeError) as exc:
+            self._report_error("Кластерный анализ", exc)
+            return None
+        self._present_result(result, engine, log=False)
+        return result
+
+    def show_profile_plot(self) -> None:
+        """Обновить кривую k(α) по текущему профилю."""
+        if not self.profile:
+            self.profile_plot.show_alpha_profile([])
+            return
+        current = None
+        if self.result is not None:
+            current = self.result.parameters.get("alpha")
+        self.profile_plot.show_alpha_profile(self.profile, current=current)
+
+    def show_matrix_plot(
+        self, engine: AlphaClusterer, result: ClusterResult
+    ) -> None:
+        """Обновить тепловую карту матрицы сходства (блоки — кластеры)."""
+        order = [
+            index
+            for label in sorted(set(result.labels))
+            for index, value in enumerate(result.labels)
+            if value == label
+        ]
+        self.matrix_plot.show_similarity_matrix(
+            engine.similarity,
+            alpha=result.parameters.get("alpha"),
+            order=order,
+            labels=result.labels,
+        )
+
+    def toggle_alpha_play(self) -> bool:
+        """Запустить или остановить «проигрывание» уровней α."""
+        if self._playing:
+            self.stop_alpha_play()
+            return False
+        self.start_alpha_play()
+        return self._playing
+
+    def start_alpha_play(self) -> None:
+        """Начать пошаговый перебор уровней α (от строгого к мягкому)."""
+        if self.method_var.get() != METHOD_ALPHA:
+            return
+        self._play_levels = sorted(DEFAULT_ALPHA_GRID, reverse=True)
+        self._play_index = 0
+        self._playing = True
+        self.play_button.configure(text="■")
+        self._tick_alpha_play()
+
+    def stop_alpha_play(self) -> None:
+        """Остановить перебор уровней α и вернуть кнопку в исходный вид."""
+        self._playing = False
+        if self._play_job is not None:
+            self.after_cancel(self._play_job)
+            self._play_job = None
+        # Позиция «в конце» — повторный вызов шага ничего не изменит.
+        self._play_index = len(self._play_levels)
+        self.play_button.configure(text="▶")
+
+    def advance_alpha_play(self) -> Optional[float]:
+        """Один шаг перебора: установить следующий α и пересчитать.
+
+        Возвращает установленный уровень или ``None``, когда уровни кончились.
+        Публичный метод — тесты вызывают его без таймеров.
+        """
+        if self._play_index >= len(self._play_levels):
+            return None
+        level = self._play_levels[self._play_index]
+        self._play_index += 1
+        self.set_alpha_value(level, recompute=True)
+        return level
+
+    def _tick_alpha_play(self) -> None:
+        self._play_job = None
+        if not self._playing:
+            return
+        if self.advance_alpha_play() is None:
+            self.stop_alpha_play()
+            return
+        self._play_job = self.after(ALPHA_PLAY_INTERVAL_MS, self._tick_alpha_play)
 
     # ------------------------------------------------------------------
     # Вывод результатов
@@ -1290,7 +1576,7 @@ class ClusteringTab(ttk.Frame):
             ),
         )
 
-    def _summary_text(self) -> str:
+    def _summary_text(self, *, include_silhouette: bool = True) -> str:
         result = self.result
         assert result is not None
         sizes = list(result.sizes)
@@ -1303,10 +1589,17 @@ class ClusteringTab(ttk.Frame):
             f"средняя внутрикластерная дисперсия = {result.average_center_variance:.4f}",
             f"максимальный диаметр = {result.max_diameter:.4f}",
         ]
-        silhouette = result.silhouette()
-        parts.append(
-            "silhouette = —" if silhouette is None else f"silhouette = {silhouette:.4f}"
-        )
+        if include_silhouette:
+            silhouette = result.silhouette()
+            parts.append(
+                "silhouette = —"
+                if silhouette is None
+                else f"silhouette = {silhouette:.4f}"
+            )
+        else:
+            # Живая перестройка: силуэт (O(n²)) не считаем — он появится после
+            # нажатия «Кластеризовать».
+            parts.append("silhouette — (нажмите «Кластеризовать»)")
         if self.profile:
             key_levels = {1.0, 0.9, 0.8, 0.7, 0.5, 0.3}
             shown = [

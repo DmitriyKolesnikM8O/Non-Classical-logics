@@ -4,7 +4,12 @@ import math
 
 import pytest
 
-from fuzzy_core import FuzzyVariableError, UniformFuzzyVariable
+from fuzzy_core import (
+    FuzzyVariableError,
+    UniformFuzzyVariable,
+    alpha_cut_trapezoid,
+    alpha_cut_triangular,
+)
 
 
 # ----------------------------------------------------------------------
@@ -161,3 +166,124 @@ def test_alpha_cut_matches_membership_test():
     assert cut == variable.core
     assert variable.membership(cut[0]) == 1.0
     assert variable.membership(cut[1]) == 1.0
+
+
+# ----------------------------------------------------------------------
+# α-срезы треугольной и трапециевидной функций принадлежности
+# ----------------------------------------------------------------------
+def triangular_membership(a, m, b, x):
+    """Функция принадлежности треугольного числа T(a, m, b)."""
+    if x < a or x > b:
+        return 0.0
+    if x <= m:
+        return (x - a) / (m - a) if m > a else 1.0
+    return (b - x) / (b - m) if b > m else 1.0
+
+
+def trapezoid_membership(a, c, d, b, x):
+    """Функция принадлежности трапеции T(a, c, d, b)."""
+    if x < a or x > b:
+        return 0.0
+    if x < c:
+        return (x - a) / (c - a)
+    if x <= d:
+        return 1.0
+    return (b - x) / (b - d)
+
+
+def test_alpha_cut_triangular_known_values():
+    assert alpha_cut_triangular(0, 5, 10, 0.5) == (2.5, 7.5)
+    assert alpha_cut_triangular(0, 5, 10, 1.0) == (5.0, 5.0)
+    assert alpha_cut_triangular(0, 5, 10, 0.1) == (0.5, 9.5)
+
+
+def test_alpha_cut_trapezoid_known_values():
+    assert alpha_cut_trapezoid(0, 2, 8, 10, 0.5) == (1.0, 9.0)
+    assert alpha_cut_trapezoid(0, 2, 8, 10, 1.0) == (2.0, 8.0)
+    assert alpha_cut_trapezoid(0, 2, 8, 10, 0.25) == (0.5, 9.5)
+
+
+@pytest.mark.parametrize(
+    "params, membership",
+    [
+        ((0.0, 5.0, 10.0), triangular_membership),
+        ((0.0, 2.0, 8.0, 10.0), trapezoid_membership),
+    ],
+)
+@pytest.mark.parametrize("alpha", [0.05, 0.25, 0.5, 0.75, 0.95])
+def test_alpha_cut_borders_have_membership_equal_to_level(params, membership, alpha):
+    cut = (
+        alpha_cut_triangular(*params, alpha)
+        if len(params) == 3
+        else alpha_cut_trapezoid(*params, alpha)
+    )
+    assert membership(*params, cut[0]) == pytest.approx(alpha)
+    assert membership(*params, cut[1]) == pytest.approx(alpha)
+
+
+@pytest.mark.parametrize("alpha", [0.1, 0.3, 0.6, 0.9, 1.0])
+def test_alpha_cut_borders_are_monotone(alpha):
+    lower = alpha_cut_triangular(0, 5, 10, alpha)
+    higher = alpha_cut_triangular(0, 5, 10, min(1.0, alpha + 0.05))
+    assert higher[0] >= lower[0] - 1e-12
+    assert higher[1] <= lower[1] + 1e-12
+    assert higher[0] <= higher[1]
+
+
+def test_alpha_cut_trapezoid_at_zero_level_is_support():
+    cut = alpha_cut_trapezoid(0, 2, 8, 10, 1e-9)
+    assert abs(cut[0] - 0.0) < 1e-6
+    assert abs(cut[1] - 10.0) < 1e-6
+
+
+@pytest.mark.parametrize("alpha", [0.1, 0.5, 0.9, 1.0])
+def test_degenerate_trapezoid_matches_uniform_alpha_cut(alpha):
+    # Равномерная μ — это трапеция с c = a и d = b.
+    variable = UniformFuzzyVariable(1.0, 3.0)
+    assert alpha_cut_trapezoid(1.0, 1.0, 3.0, 3.0, alpha) == variable.alpha_cut(alpha)
+
+
+def test_alpha_cut_of_triangle_and_trapezoid_is_empty_above_one():
+    assert alpha_cut_triangular(0, 5, 10, 1.5) == ()
+    assert alpha_cut_trapezoid(0, 2, 8, 10, 1.5) == ()
+
+
+@pytest.mark.parametrize("alpha", [0.0, -0.5, math.inf, math.nan])
+def test_alpha_cut_of_triangle_and_trapezoid_rejects_invalid_level(alpha):
+    with pytest.raises(FuzzyVariableError):
+        alpha_cut_triangular(0, 5, 10, alpha)
+    with pytest.raises(FuzzyVariableError):
+        alpha_cut_trapezoid(0, 2, 8, 10, alpha)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        (5.0, 2.0, 8.0, 10.0),  # a > c
+        (0.0, 2.0, 9.0, 8.0),  # d > b
+        (0.0, 5.0, 4.0, 10.0),  # c > d
+    ],
+)
+def test_alpha_cut_trapezoid_rejects_bad_ordering(args):
+    with pytest.raises(FuzzyVariableError):
+        alpha_cut_trapezoid(*args, 0.5)
+
+
+@pytest.mark.parametrize("args", [(5.0, 3.0, 10.0), (0.0, 11.0, 10.0)])
+def test_alpha_cut_triangular_rejects_bad_ordering(args):
+    with pytest.raises(FuzzyVariableError):
+        alpha_cut_triangular(*args, 0.5)
+
+
+@pytest.mark.parametrize("bad", [math.inf, math.nan])
+def test_alpha_cut_rejects_non_finite_parameters(bad):
+    with pytest.raises(FuzzyVariableError):
+        alpha_cut_trapezoid(0, 2, 8, bad, 0.5)
+    with pytest.raises(FuzzyVariableError):
+        alpha_cut_triangular(0, bad, 10, 0.5)
+
+
+def test_crisp_triangle_and_degenerate_trapezoid():
+    """Вырожденные случаи: треугольник в точку и «прямоугольник»."""
+    assert alpha_cut_triangular(5, 5, 5, 0.5) == (5.0, 5.0)
+    assert alpha_cut_trapezoid(1, 2, 2, 3, 0.5) == (1.5, 2.5)

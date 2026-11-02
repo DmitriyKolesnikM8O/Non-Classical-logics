@@ -271,3 +271,121 @@ def test_curves_legend_shown_normally(tk_window):
     legend = plot.axes.get_legend()
     assert legend is not None
     assert [text.get_text() for text in legend.get_texts()] == ["A", "B"]
+
+
+# ----------------------------------------------------------------------
+# Профиль k(α)
+# ----------------------------------------------------------------------
+def test_show_alpha_profile_stores_sorted_points(tk_window):
+    plot = MembershipPlot(tk_window, toolbar=False)
+    profile = [
+        {"alpha": 0.8, "cluster_count": 8},
+        {"alpha": 1.0, "cluster_count": 300},
+        {"alpha": 0.5, "cluster_count": 3},
+    ]
+    plot.show_alpha_profile(profile, current=0.7)
+    assert plot.profile_points == ((0.5, 3), (0.8, 8), (1.0, 300))
+    assert plot.current_alpha == pytest.approx(0.7)
+
+
+def test_show_alpha_profile_draws_step_curve_and_marker(tk_window):
+    plot = MembershipPlot(tk_window, toolbar=False)
+    plot.show_alpha_profile(
+        [{"alpha": 1.0, "cluster_count": 5}, {"alpha": 0.5, "cluster_count": 2}],
+        current=0.5,
+    )
+    assert len(plot.axes.lines) >= 2  # ступенька + вертикальный маркер
+    legend = plot.axes.get_legend()
+    assert legend is not None
+    assert any("α" in text.get_text() for text in legend.get_texts())
+
+
+def test_show_alpha_profile_panel_is_cleared_between_calls(tk_window):
+    plot = MembershipPlot(tk_window, toolbar=False)
+    plot.show_alpha_profile([{"alpha": 1.0, "cluster_count": 4}])
+    plot.show_alpha_profile([{"alpha": 1.0, "cluster_count": 7}, {"alpha": 0.5, "cluster_count": 1}])
+    assert plot.profile_points == ((0.5, 1), (1.0, 7))
+    assert plot.current_alpha is None
+
+
+def test_show_alpha_profile_empty_is_allowed(tk_window):
+    plot = MembershipPlot(tk_window, toolbar=False)
+    plot.show_alpha_profile([])
+    assert plot.profile_points == ()
+    assert plot.axes.get_legend() is None
+
+
+def test_reset_clears_alpha_profile(tk_window):
+    plot = MembershipPlot(tk_window, toolbar=False)
+    plot.show_alpha_profile([{"alpha": 1.0, "cluster_count": 3}], current=0.9)
+    plot.reset()
+    assert plot.profile_points == ()
+    assert plot.current_alpha is None
+
+
+# ----------------------------------------------------------------------
+# Матрица сходства
+# ----------------------------------------------------------------------
+def test_show_similarity_matrix_reorders_rows_and_columns(tk_window):
+    plot = MembershipPlot(tk_window, toolbar=False)
+    matrix = [
+        [1.0, 0.2, 0.1],
+        [0.2, 1.0, 0.3],
+        [0.1, 0.3, 1.0],
+    ]
+    plot.show_similarity_matrix(matrix, alpha=0.5, order=[2, 0, 1])
+    assert plot.matrix_size == 3
+    assert plot.matrix_order == (2, 0, 1)
+    assert plot.matrix_alpha == pytest.approx(0.5)
+    assert plot.matrix_values == [
+        [1.0, 0.1, 0.3],
+        [0.1, 1.0, 0.2],
+        [0.3, 0.2, 1.0],
+    ]
+    assert len(plot.axes.images) == 2  # базовая карта + подсветка α-среза
+
+
+def test_show_similarity_matrix_without_alpha_has_single_layer(tk_window):
+    plot = MembershipPlot(tk_window, toolbar=False)
+    plot.show_similarity_matrix([[1.0, 0.4], [0.4, 1.0]])
+    assert len(plot.axes.images) == 1
+    assert plot.matrix_alpha is None
+    assert plot.matrix_order == (0, 1)
+
+
+def test_show_similarity_matrix_draws_cluster_boundaries(tk_window):
+    plot = MembershipPlot(tk_window, toolbar=False)
+    size = 6
+    matrix = [[1.0] * size for _ in range(size)]
+    labels = [0, 0, 0, 1, 1, 1]
+    plot.show_similarity_matrix(matrix, alpha=0.9, order=list(range(size)), labels=labels)
+    # Одна граница между двумя блоками: горизонтальная + вертикальная линия.
+    assert len(plot.axes.lines) == 2
+
+
+def test_show_similarity_matrix_rejects_non_square(tk_window):
+    plot = MembershipPlot(tk_window, toolbar=False)
+    with pytest.raises(ValueError):
+        plot.show_similarity_matrix([[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]])
+
+
+def test_show_similarity_matrix_rejects_bad_order(tk_window):
+    plot = MembershipPlot(tk_window, toolbar=False)
+    with pytest.raises(ValueError):
+        plot.show_similarity_matrix([[1.0, 0.0], [0.0, 1.0]], order=[0, 0])
+
+
+def test_show_similarity_matrix_empty_is_allowed(tk_window):
+    plot = MembershipPlot(tk_window, toolbar=False)
+    plot.show_similarity_matrix([], alpha=0.5)
+    assert plot.matrix_size == 0
+    assert len(plot.axes.images) == 0
+
+
+def test_reset_clears_similarity_matrix(tk_window):
+    plot = MembershipPlot(tk_window, toolbar=False)
+    plot.show_similarity_matrix([[1.0, 0.0], [0.0, 1.0]], alpha=0.5)
+    plot.reset()
+    assert plot.matrix_size == 0
+    assert plot.matrix_alpha is None
+    assert plot.matrix_values == []

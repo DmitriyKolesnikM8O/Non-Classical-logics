@@ -23,6 +23,8 @@ from typing import Callable, Iterator, Tuple
 __all__ = [
     "UniformFuzzyVariable",
     "FuzzyVariableError",
+    "alpha_cut_triangular",
+    "alpha_cut_trapezoid",
     "euclidean_distance",
     "hausdorff_distance",
     "DISTANCE_METRICS",
@@ -32,6 +34,18 @@ __all__ = [
 
 class FuzzyVariableError(ValueError):
     """Некорректные параметры нечеткой величины."""
+
+
+def _validate_alpha_level(alpha: float) -> float:
+    """Проверить α-уровень (конечное число, ``alpha > 0``)."""
+    value = float(alpha)
+    if not math.isfinite(value):
+        raise FuzzyVariableError("α-уровень должен быть конечным числом")
+    if value <= 0.0:
+        raise FuzzyVariableError(
+            f"α-уровень должен быть больше нуля, получено {alpha!r}"
+        )
+    return value
 
 
 class UniformFuzzyVariable:
@@ -139,15 +153,12 @@ class UniformFuzzyVariable:
         Поэтому в варианте 1 осмысленный «уровень отбора» задаётся не на
         величине, а на отношении сходства между величинами — см.
         :func:`fuzzy_core.clustering.alpha_cut_clustering`.
+
+        Общие формулы среза для трапеции и треугольника — см.
+        :func:`alpha_cut_trapezoid` и :func:`alpha_cut_triangular`.
         """
-        alpha = float(alpha)
-        if not math.isfinite(alpha):
-            raise FuzzyVariableError("α-уровень должен быть конечным числом")
-        if alpha <= 0.0:
-            raise FuzzyVariableError(
-                f"α-уровень должен быть больше нуля, получено {alpha!r}"
-            )
-        if alpha > 1.0:
+        level = _validate_alpha_level(alpha)
+        if level > 1.0:
             return ()
         return (self._a, self._b)
 
@@ -323,6 +334,65 @@ class UniformFuzzyVariable:
 
     def __repr__(self) -> str:
         return f"UniformFuzzyVariable(a={self._a:g}, b={self._b:g})"
+
+
+# ----------------------------------------------------------------------
+# α-срезы для других форм функции принадлежности
+# ----------------------------------------------------------------------
+def alpha_cut_trapezoid(
+    a: float,
+    c: float,
+    d: float,
+    b: float,
+    alpha: float = 1.0,
+) -> Tuple[float, ...]:
+    """α-срез трапециевидной функции принадлежности ``T(a, c, d, b)``.
+
+    Функция принадлежности равна 0 вне ``[a, b]``, линейно растёт от 0 до 1 на
+    ``[a, c]``, держится равной 1 на ``[c, d]`` и линейно падает до 0 на
+    ``[d, b]``. Тогда ``μ(x) = alpha`` достигается на границах
+
+    ``x_left  = a + alpha * (c - a)``,
+    ``x_right = b - alpha * (b - d)``.
+
+    Равномерная функция принадлежности — вырожденный случай ``c = a, d = b``:
+    срез совпадает с носителем ``[a, b]`` и не зависит от уровня. При
+    ``alpha = 1`` срез равен плато ``[c, d]``, при ``alpha > 1`` — пуст.
+    """
+    a, c, d, b = float(a), float(c), float(d), float(b)
+    if not all(math.isfinite(value) for value in (a, c, d, b)):
+        raise FuzzyVariableError("Параметры трапеции должны быть конечными числами")
+    if not a <= c <= d <= b:
+        raise FuzzyVariableError(
+            "Должно выполняться a <= c <= d <= b, получено "
+            f"a={a!r}, c={c!r}, d={d!r}, b={b!r}"
+        )
+    level = _validate_alpha_level(alpha)
+    if level > 1.0:
+        return ()
+    return (a + level * (c - a), b - level * (b - d))
+
+
+def alpha_cut_triangular(
+    a: float,
+    m: float,
+    b: float,
+    alpha: float = 1.0,
+) -> Tuple[float, ...]:
+    """α-срез треугольной функции принадлежности ``T(a, m, b)``.
+
+    Вершина ``m`` — точка, где ``μ(m) = 1``. Это частный случай
+    :func:`alpha_cut_trapezoid` при ``c = d = m``:
+
+    ``x_left  = a + alpha * (m - a)``,
+    ``x_right = b - alpha * (b - m)``.
+
+    При ``alpha = 1`` срез вырождается в точку ``(m, m)``, при ``alpha > 1``
+    пуст. Треугольная форма к варианту 1 не относится: у равномерной ``μ``
+    плато занимает весь носитель (``c = a``, ``d = b``), поэтому срез не зависит
+    от уровня — см. :meth:`UniformFuzzyVariable.alpha_cut`.
+    """
+    return alpha_cut_trapezoid(a, m, m, b, alpha)
 
 
 # ----------------------------------------------------------------------

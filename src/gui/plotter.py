@@ -15,13 +15,20 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.colors import to_hex
 from matplotlib.figure import Figure
 
 from fuzzy_core import NOISE_LABEL
 
-__all__ = ["COLORS", "NOISE_COLOR", "MembershipPlot", "distinct_colors", "membership_points"]
+__all__ = [
+    "COLORS",
+    "NOISE_COLOR",
+    "MembershipPlot",
+    "distinct_colors",
+    "membership_points",
+]
 
 #: Набор цветов для кривых и кластеров.
 COLORS: Tuple[str, ...] = (
@@ -156,6 +163,12 @@ class MembershipPlot(ttk.Frame):
         self._groups = []
         self._centroids = []
         self._group_colors = {}
+        self._profile: List[Tuple[float, int]] = []
+        self._profile_current: Optional[float] = None
+        self._matrix_size = 0
+        self._matrix_alpha: Optional[float] = None
+        self._matrix_order: Tuple[int, ...] = ()
+        self._matrix_values: List[List[float]] = []
 
     def show_variables(
         self,
@@ -279,6 +292,137 @@ class MembershipPlot(ttk.Frame):
                 self.axes.legend(loc="upper right", fontsize=8)
             self.redraw()
 
+    def show_alpha_profile(
+        self,
+        profile: Iterable[Any],
+        *,
+        current: Optional[float] = None,
+        title: Optional[str] = None,
+        xlabel: str = "уровень отбора α",
+        ylabel: str = "число кластеров k(α)",
+    ) -> None:
+        """Кривая-ступенька ``k(α)``: как уровень отбора влияет на число кластеров.
+
+        ``profile`` — последовательность словарей ``{"alpha": .., "cluster_count": ..}``
+        (как их отдаёт :func:`fuzzy_core.alpha_cut_profile`). Ступеньки
+        подчёркивают, что при изменении α число кластеров меняется скачками;
+        ``current`` (если задан) отмечает текущий уровень вертикальной линией.
+        """
+        points = sorted(
+            (float(point["alpha"]), int(point["cluster_count"])) for point in profile
+        )
+        self._prepare(
+            title or "Профиль k(α): число кластеров от уровня отбора", xlabel, ylabel
+        )
+        self._profile = points
+        self._profile_current = None if current is None else float(current)
+
+        if points:
+            xs = [alpha for alpha, _ in points]
+            ys = [count for _, count in points]
+            self.axes.step(
+                xs,
+                ys,
+                where="post",
+                color=COLORS[0],
+                linewidth=2.0,
+                marker="o",
+                markersize=4,
+                label="k(α)",
+            )
+            self.axes.set_ylim(0.0, max(ys) * 1.15 + 1.0)
+            if self._profile_current is not None:
+                self.axes.axvline(
+                    self._profile_current,
+                    color=COLORS[1],
+                    linestyle="--",
+                    linewidth=1.5,
+                    label=f"текущий α = {self._profile_current:.2f}",
+                )
+            self.axes.legend(loc="upper right", fontsize=8)
+        self.redraw()
+
+    def show_similarity_matrix(
+        self,
+        matrix: Sequence[Sequence[float]],
+        *,
+        alpha: Optional[float] = None,
+        order: Optional[Sequence[int]] = None,
+        labels: Optional[Sequence[int]] = None,
+        title: Optional[str] = None,
+    ) -> None:
+        """Тепловая карта матрицы сходства с подсветкой α-среза.
+
+        ``order`` — перестановка индексов (например, «сначала кластер 0, потом
+        кластер 1...»): строки и столбцы переставляются так, чтобы кластеры
+        лежали блоками на диагонали. ``labels`` — метки кластеров в исходном
+        порядке; по ним рисуются границы блоков. Клетки со сходством
+        ``r_ij ≥ alpha`` подсвечиваются отдельным слоем поверх карты. Шкала
+        сходства — от 0 до 1 (полоса цветов не рисуется, значение указано в
+        пометке).
+        """
+        rows = [[float(value) for value in row] for row in matrix]
+        size = len(rows)
+        if any(len(row) != size for row in rows):
+            raise ValueError("матрица сходства должна быть квадратной")
+
+        if order is None:
+            sequence = list(range(size))
+        else:
+            sequence = [int(index) for index in order]
+            if sorted(sequence) != list(range(size)):
+                raise ValueError("order должен быть перестановкой индексов 0..n-1")
+
+        self._prepare(
+            title or "Матрица сходства R (блоки = кластеры)",
+            "индекс (упорядочено по кластерам)",
+            "индекс (упорядочено по кластерам)",
+        )
+        self._matrix_size = size
+        self._matrix_alpha = None if alpha is None else float(alpha)
+        self._matrix_order = tuple(sequence)
+        self._matrix_values = [[rows[i][j] for j in sequence] for i in sequence]
+        # Тепловая карта: сетка осей и легенда здесь только мешают.
+        self.axes.grid(False)
+        if size == 0:
+            self.redraw()
+            return
+
+        data = np.array(self._matrix_values)
+        self.axes.imshow(
+            data,
+            vmin=0.0,
+            vmax=1.0,
+            cmap="viridis",
+            interpolation="nearest",
+            aspect="auto",
+        )
+
+        note = "шкала сходства r: 0 … 1"
+        if self._matrix_alpha is not None:
+            highlight = np.ma.masked_where(data < self._matrix_alpha, data)
+            self.axes.imshow(
+                highlight,
+                vmin=0.0,
+                vmax=1.0,
+                cmap="autumn",
+                interpolation="nearest",
+                aspect="auto",
+                alpha=0.45,
+            )
+            note += f"; подсвечено r ≥ α = {self._matrix_alpha:.2f}"
+
+        if labels is not None:
+            ordered_labels = [int(labels[i]) for i in sequence]
+            for position in range(1, size):
+                if ordered_labels[position] != ordered_labels[position - 1]:
+                    boundary = position - 0.5
+                    self.axes.axhline(boundary, color="white", linewidth=1.2)
+                    self.axes.axvline(boundary, color="white", linewidth=1.2)
+
+        self._legend_note(note)
+        self.redraw()
+
     def _legend_note(self, text: str) -> None:
         """Короткая пометка вместо слишком большой легенды."""
         self.axes.text(
@@ -355,3 +499,33 @@ class MembershipPlot(ttk.Frame):
         for group in self._groups:
             sizes[group] = sizes.get(group, 0) + 1
         return sizes
+
+    @property
+    def profile_points(self) -> Tuple[Tuple[float, int], ...]:
+        """Точки кривой k(α) в порядке возрастания уровня."""
+        return tuple(self._profile)
+
+    @property
+    def current_alpha(self) -> Optional[float]:
+        """Отмеченный на профиле текущий уровень α (или ``None``)."""
+        return self._profile_current
+
+    @property
+    def matrix_size(self) -> int:
+        """Размер показанной матрицы сходства."""
+        return self._matrix_size
+
+    @property
+    def matrix_alpha(self) -> Optional[float]:
+        """Уровень α, которым подсвечена матрица (или ``None``)."""
+        return self._matrix_alpha
+
+    @property
+    def matrix_order(self) -> Tuple[int, ...]:
+        """Порядок индексов, в котором показана матрица."""
+        return self._matrix_order
+
+    @property
+    def matrix_values(self) -> List[List[float]]:
+        """Матрица сходства в показанном (переупорядоченном) виде."""
+        return [list(row) for row in self._matrix_values]

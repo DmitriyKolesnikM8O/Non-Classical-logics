@@ -364,7 +364,12 @@ class LegendPanel(ttk.Frame):
             self.rows.append(row)
         self.canvas.yview_moveto(0.0)
         self._bind_wheel(self.canvas)
-        self.canvas.update_idletasks()
+        # Область прокрутки пересчитываем в простое: синхронный
+        # ``update_idletasks()`` здесь заставлял Tk немедленно дорисовать все
+        # отложенные графики (ползунок α работал бы заметно медленнее).
+        self.after_idle(self._refresh_scrollregion)
+
+    def _refresh_scrollregion(self) -> None:
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
     def clear(self) -> None:

@@ -256,7 +256,7 @@ def test_plot_and_tables_live_in_resizable_pane(tab):
 def test_legend_button_is_disabled_before_run(tab):
     assert str(tab.legend_button.cget("state")) == "disabled"
     assert tab.legend_visible is False
-    assert tab.plot_area.panes() == (str(tab.plot),)
+    assert tab.plot_area.panes() == (str(tab.view_notebook),)
 
 
 def test_legend_panel_toggles_by_button(tab):
@@ -270,13 +270,13 @@ def test_legend_panel_toggles_by_button(tab):
     assert tab.toggle_legend() is True
     assert tab.legend_visible is True
     assert [str(pane) for pane in tab.plot_area.panes()] == [
-        str(tab.plot),
+        str(tab.view_notebook),
         str(tab.legend_panel),
     ]
     assert tab.legend_button.cget("text") == "Скрыть легенду"
 
     assert tab.toggle_legend() is False
-    assert tab.plot_area.panes() == (str(tab.plot),)
+    assert tab.plot_area.panes() == (str(tab.view_notebook),)
     assert tab.legend_button.cget("text") == "Показать легенду (3)"
 
 
@@ -530,3 +530,212 @@ def test_app_generates_sample_and_clusters_it(tk_window, tmp_path):
         assert widget.run() is None
     finally:
         application.close()
+
+
+# ----------------------------------------------------------------------
+# Интерактивный α-уровень: ползунок, профиль k(α), матрица сходства
+# ----------------------------------------------------------------------
+def run_alpha(tab, alpha="0.7"):
+    tab.method_var.set(METHOD_ALPHA)
+    tab._update_parameter_state()
+    tab.alpha_entry.set(alpha)
+    return tab.run()
+
+
+def test_alpha_slider_is_disabled_for_other_methods(tab):
+    assert str(tab.alpha_scale.cget("state")) == "disabled"
+    assert str(tab.play_button.cget("state")) == "disabled"
+    tab.method_var.set(METHOD_ALPHA)
+    tab._update_parameter_state()
+    assert str(tab.alpha_scale.cget("state")) == "normal"
+    assert str(tab.play_button.cget("state")) == "normal"
+
+
+def tab_state(tab, index):
+    return str(tab.view_notebook.tab(index, "state"))
+
+
+def test_alpha_only_tabs_are_disabled_for_other_methods(tab):
+    assert tab_state(tab, 0) == "normal"
+    assert tab_state(tab, 1) == "disabled"
+    assert tab_state(tab, 2) == "disabled"
+
+
+def test_alpha_tabs_enabled_for_alpha_method(tab):
+    tab.method_var.set(METHOD_ALPHA)
+    tab._update_parameter_state()
+    assert tab_state(tab, 0) == "normal"
+    assert tab_state(tab, 1) == "normal"
+    assert tab_state(tab, 2) == "normal"
+
+
+def test_switching_away_from_alpha_disables_tabs_and_returns_to_diagram(tab):
+    tab.method_var.set(METHOD_ALPHA)
+    tab._update_parameter_state()
+    tab.view_notebook.select(2)  # открыта «Матрица сходства»
+
+    tab.method_var.set(METHOD_THRESHOLD)
+    tab._update_parameter_state()
+    assert tab_state(tab, 1) == "disabled"
+    assert tab_state(tab, 2) == "disabled"
+    assert tab.view_notebook.index("current") == 0
+
+
+def test_non_alpha_run_keeps_alpha_tabs_disabled(tab):
+    tab.method_var.set(METHOD_DENSITY)
+    tab._update_parameter_state()
+    tab.eps_entry.set("1.0")
+    tab.run()
+    assert tab_state(tab, 1) == "disabled"
+    assert tab_state(tab, 2) == "disabled"
+
+
+def test_alpha_slider_syncs_entry_and_label(tab):
+    tab.method_var.set(METHOD_ALPHA)
+    tab._update_parameter_state()
+    assert float(tab.alpha_scale.get()) == pytest.approx(0.7)
+    tab.set_alpha_value(0.5)
+    assert tab.alpha_entry.text == "0.50"
+    assert tab.alpha_value_label.cget("text") == "α = 0.50"
+    assert float(tab.alpha_scale.get()) == pytest.approx(0.5)
+
+
+def test_alpha_scale_schedules_coalesced_recompute(tab):
+    run_alpha(tab)
+    tab._on_alpha_scale("0.5")
+    assert tab.alpha_entry.text == "0.50"
+    assert tab._alpha_job is not None
+    # Повторное движение отменяет прежнюю задачу — пересчёт один.
+    first_job = tab._alpha_job
+    tab._on_alpha_scale("0.4")
+    assert tab._alpha_job != first_job
+    tab.after_cancel(tab._alpha_job)
+    tab._alpha_job = None
+
+
+def test_alpha_live_change_reclusters_without_logging(tab):
+    result = run_alpha(tab)
+    log_after_run = tab.logger.read()
+    moved = tab.set_alpha_value(0.5)
+    assert moved == pytest.approx(0.5)
+    assert tab.result is not None
+    assert tab.result.parameters["alpha"] == pytest.approx(0.5)
+    # Живая перестройка не пишется в журнал заново.
+    assert tab.logger.read() == log_after_run
+    assert result is not tab.result
+
+
+def test_alpha_live_change_uses_cached_engine(tab):
+    run_alpha(tab)
+    engine = tab.engine
+    tab.set_alpha_value(0.6)
+    assert tab.engine is engine  # матрицы не пересчитываются
+
+
+def test_run_alpha_fills_profile_and_matrix_views(tab, sample):
+    result = run_alpha(tab, "0.6")
+    assert tab.profile_plot.profile_points
+    assert len(tab.profile_plot.profile_points) == 10
+    assert tab.profile_plot.current_alpha == pytest.approx(0.6)
+    assert tab.matrix_plot.matrix_size == len(sample)
+    assert tab.matrix_plot.matrix_alpha == pytest.approx(0.6)
+
+
+def test_matrix_view_is_ordered_by_clusters(tab, sample):
+    result = run_alpha(tab, "0.5")
+    expected = [
+        index
+        for label in sorted(set(result.labels))
+        for index, value in enumerate(result.labels)
+        if value == label
+    ]
+    assert list(tab.matrix_plot.matrix_order) == expected
+    assert sorted(tab.matrix_plot.matrix_order) == list(range(len(sample)))
+
+
+def test_explicit_run_draws_all_views_regardless_of_active_tab(tab):
+    tab.view_notebook.select(1)  # активна вкладка «Профиль k(α)»
+    tab._update_parameter_state()
+    run_alpha(tab, "0.6")
+    assert tab._stale_views == set()
+    assert tab.profile_plot.current_alpha == pytest.approx(0.6)
+    assert tab.matrix_plot.matrix_alpha == pytest.approx(0.6)
+
+
+def test_live_change_defers_hidden_views_until_tab_switch(tab):
+    run_alpha(tab, "0.6")  # активна закладка «Диаграмма»
+    tab.view_notebook.select(1)  # переключаемся на «Профиль k(α)»
+    tab._on_view_changed()
+
+    tab.set_alpha_value(0.5)  # живой пересчёт
+    assert "matrix" in tab._stale_views
+    assert "scatter" in tab._stale_views
+    assert "profile" not in tab._stale_views
+    assert tab.profile_plot.current_alpha == pytest.approx(0.5)
+    assert tab.matrix_plot.matrix_alpha == pytest.approx(0.6)  # ещё старое
+
+    tab.view_notebook.select(2)  # открываем «Матрицу сходства»
+    tab._on_view_changed()
+    assert "matrix" not in tab._stale_views
+    assert tab.matrix_plot.matrix_alpha == pytest.approx(0.5)
+
+
+def test_live_change_summary_skips_silhouette(tab):
+    run_alpha(tab, "0.7")
+    assert "silhouette = " in tab.result_label.cget("text")
+    tab.set_alpha_value(0.5)
+    assert "нажмите «Кластеризовать»" in tab.result_label.cget("text")
+
+
+def test_non_alpha_run_clears_alpha_views(tab):
+    run_alpha(tab)
+    assert tab.profile_plot.profile_points
+    tab.method_var.set(METHOD_THRESHOLD)
+    tab._update_parameter_state()
+    tab.threshold_entry.set("0.1")
+    tab.run()
+    assert tab.profile == []
+    assert tab.profile_plot.profile_points == ()
+    assert tab.matrix_plot.matrix_size == 0
+
+
+def test_alpha_play_steps_through_levels(tab):
+    run_alpha(tab)
+    tab.start_alpha_play()
+    assert tab._playing is True
+    assert tab.play_button.cget("text") == "■"
+    # start уже сделал первый шаг: α = 1.0.
+    assert float(tab.alpha_entry.number()) == pytest.approx(1.0)
+    assert tab.advance_alpha_play() == pytest.approx(0.9)
+    assert float(tab.alpha_entry.number()) == pytest.approx(0.9)
+    tab.stop_alpha_play()
+    assert tab._playing is False
+    assert tab.play_button.cget("text") == "▶"
+    assert tab.advance_alpha_play() is None  # после остановки шаги не идут
+
+
+def test_alpha_play_toggle_runs_and_stops(tab):
+    run_alpha(tab)
+    assert tab.toggle_alpha_play() is True
+    assert tab._playing is True
+    assert tab.toggle_alpha_play() is False
+    assert tab._playing is False
+
+
+def test_alpha_play_finishes_and_resets_button(tab):
+    run_alpha(tab)
+    tab.start_alpha_play()
+    for _ in range(len(tab._play_levels)):
+        tab.advance_alpha_play()
+    assert tab.advance_alpha_play() is None
+    tab.stop_alpha_play()
+    assert tab.play_button.cget("text") == "▶"
+
+
+def test_alpha_play_stops_when_switching_method(tab):
+    run_alpha(tab)
+    tab.start_alpha_play()
+    assert tab._playing is True
+    tab.method_var.set(METHOD_KMEANS)
+    tab._update_parameter_state()
+    assert tab._playing is False

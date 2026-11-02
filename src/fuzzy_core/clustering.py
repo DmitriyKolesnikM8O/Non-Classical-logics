@@ -24,7 +24,7 @@ import heapq
 import math
 import random
 import statistics
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .fuzzy_variable import UniformFuzzyVariable, get_distance_function
@@ -37,6 +37,8 @@ except ImportError:  # pragma: no cover - окружение без numpy
 __all__ = [
     "Cluster",
     "ClusterResult",
+    "Agglomeration",
+    "AlphaClusterer",
     "kmeans",
     "threshold_clustering",
     "alpha_cut_clustering",
@@ -49,6 +51,9 @@ __all__ = [
 ]
 
 NOISE_LABEL = -1
+
+#: Допуск при сравнении высот слияний с порогом (защита от ошибок округления).
+_HEIGHT_EPS = 1e-12
 
 
 # ----------------------------------------------------------------------
@@ -418,16 +423,79 @@ def kmeans(
 # ----------------------------------------------------------------------
 # Кластеризация по порогу (полная связь)
 # ----------------------------------------------------------------------
+@dataclass(frozen=True)
+class Agglomeration:
+    """Трасса агломеративной кластеризации (критерий полной связи).
+
+    Хранит полную последовательность слияний: пары узлов и высоту (расстояние)
+    каждого слияния. Листья — исходные величины с индексами ``0 ... size-1``.
+    По трассе можно быстро получить разбиение при любом пороге (см.
+    :meth:`labels`), не пересчитывая матрицу расстояний заново — это и нужно
+    интерфейсу для интерактивного перебора уровня.
+    """
+
+    size: int
+    merges: Tuple[Tuple[int, int, float], ...] = ()
+
+    @property
+    def heights(self) -> Tuple[float, ...]:
+        """Высоты слияний по порядку их выполнения."""
+        return tuple(height for _, _, height in self.merges)
+
+    def labels(self, threshold: float) -> List[int]:
+        """Метки кластеров при разрезе дендрограммы на высоте ``threshold``.
+
+        Слияния выше порога не выполняются. Метки неотрицательны и нумеруются
+        в порядке появления; у элементов одного кластера метка совпадает.
+        """
+        parent = list(range(self.size))
+
+        def find(index: int) -> int:
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        for first, second, height in self.merges:
+            if height > threshold + _HEIGHT_EPS:
+                continue
+            root_first, root_second = find(first), find(second)
+            if root_first != root_second:
+                parent[root_second] = root_first
+
+        mapping: Dict[int, int] = {}
+        result: List[int] = []
+        for index in range(self.size):
+            root = find(index)
+            if root not in mapping:
+                mapping[root] = len(mapping)
+            result.append(mapping[root])
+        return result
+
+    def cluster_count(self, threshold: float) -> int:
+        """Число кластеров при разрезе дендрограммы на высоте ``threshold``."""
+        return len(set(self.labels(threshold)))
+
+
+def _group_by_labels(labels: Sequence[int]) -> List[List[int]]:
+    """Индексы элементов, сгруппированные по меткам кластеров."""
+    groups: Dict[int, List[int]] = {}
+    for index, label in enumerate(labels):
+        groups.setdefault(int(label), []).append(index)
+    return list(groups.values())
+
+
 def _agglomerate(
     items: Sequence[UniformFuzzyVariable],
     distance: Callable[[Any, Any], float],
     threshold: Optional[float] = None,
-) -> Tuple[List[List[int]], List[float]]:
+) -> Tuple[List[List[int]], List[float], List[Tuple[int, int, float]]]:
     """Агломеративная кластеризация с критерием полной связи.
 
-    Возвращает ``(группы индексов, высоты слияний)``. Если ``threshold``
-    задан, слияния выше порога не выполняются; если ``None`` — выполняется
-    весь процесс, а высоты собираются целиком (нужно для профиля α-уровней).
+    Возвращает ``(группы индексов, высоты слияний, слияния)``. Если
+    ``threshold`` задан, слияния выше порога не выполняются; если ``None`` —
+    выполняется весь процесс, а высоты и пары собираются целиком (нужны для
+    профиля α-уровней и для интерактивного разреза дендрограммы).
     """
     size = len(items)
     matrix = _distance_matrix(items, distance)
@@ -435,6 +503,7 @@ def _agglomerate(
     pair_distance: Dict[Tuple[int, int], float] = {}
     heap: List[Tuple[float, int, int]] = []
     heights: List[float] = []
+    merges: List[Tuple[int, int, float]] = []
 
     for i in range(size):
         for j in range(i + 1, size):
@@ -452,6 +521,7 @@ def _agglomerate(
             break  # минимальное расстояние по полной связи превысило порог
 
         heights.append(value)
+        merges.append((first, second, value))
         merged = clusters[first] + clusters[second]
         del clusters[second]
         clusters[first] = merged
@@ -464,7 +534,7 @@ def _agglomerate(
             pair_distance[key] = new_value
             heapq.heappush(heap, (new_value, key[0], key[1]))
 
-    return list(clusters.values()), heights
+    return list(clusters.values()), heights, merges
 
 
 def threshold_clustering(
@@ -489,7 +559,7 @@ def threshold_clustering(
     if not items:
         return _build_result(items, [], "threshold", metric, parameters)
 
-    groups, _ = _agglomerate(items, get_distance_function(metric), threshold)
+    groups, _, _ = _agglomerate(items, get_distance_function(metric), threshold)
     return _build_result(items, groups, "threshold", metric, parameters)
 
 
@@ -565,6 +635,19 @@ def _validate_alpha(alpha: float) -> float:
     return value
 
 
+def _validate_scale(scale: Optional[float]) -> Optional[float]:
+    """Проверить масштаб расстояний ``d0`` (положительное конечное число)."""
+    if scale is None:
+        return None
+    value = float(scale)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(
+            "масштаб расстояний должен быть положительным числом, "
+            f"получено {scale!r}"
+        )
+    return value
+
+
 def _similarity_data(
     items: Sequence[UniformFuzzyVariable],
     distance: Callable[[Any, Any], float],
@@ -578,12 +661,7 @@ def _similarity_data(
     if scale is None:
         d0 = max((max(row) for row in distances), default=0.0)
     else:
-        d0 = float(scale)
-        if not math.isfinite(d0) or d0 <= 0.0:
-            raise ValueError(
-                "масштаб расстояний должен быть положительным числом, "
-                f"получено {scale!r}"
-            )
+        d0 = _validate_scale(scale) or 0.0
     if d0 <= 0.0:
         # Все величины совпадают: сходство максимально на всех парах.
         return [[1.0] * size for _ in range(size)], 0.0
@@ -705,28 +783,18 @@ def alpha_cut_clustering(
             f"Неизвестный тип связи {linkage!r}. Доступны: single, complete"
         )
     items = _as_items(variables)
-    parameters: Dict[str, Any] = {
-        "alpha": level,
-        "linkage": key,
-        "closure": bool(closure) and key == "single",
-    }
     if not items:
+        parameters = {
+            "alpha": level,
+            "linkage": key,
+            "closure": bool(closure) and key == "single",
+        }
         return _build_result(items, [], "alpha", metric, parameters)
 
-    matrix, d0 = _similarity_data(items, get_distance_function(metric), scale)
-    parameters["distance_scale"] = d0
-
-    if key == "complete":
-        # Сходство >= alpha  <=>  расстояние <= (1 - alpha) * d0.
-        result = threshold_clustering(
-            items, threshold=(1.0 - level) * d0, metric=metric
-        )
-        return replace(result, method="alpha", parameters=parameters)
-
-    if closure:
-        matrix = max_min_closure(matrix)
-    groups = _alpha_components(matrix, level)
-    return _build_result(items, groups, "alpha", metric, parameters)
+    engine = AlphaClusterer(
+        items, metric=metric, linkage=key, closure=closure, scale=scale
+    )
+    return engine.clustering(level)
 
 
 DEFAULT_ALPHA_GRID: Tuple[float, ...] = (
@@ -762,28 +830,148 @@ def alpha_cut_profile(
     if not items:
         return [{"alpha": level, "cluster_count": 0} for level in levels]
 
-    distance = get_distance_function(metric)
-    matrix, d0 = _similarity_data(items, distance, scale)
+    engine = AlphaClusterer(
+        items, metric=metric, linkage=key, closure=closure, scale=scale
+    )
+    return engine.profile(levels)
 
-    if key == "complete":
-        # Дендрограмма строится один раз, уровни — просто разрезы по высоте.
-        _, heights = _agglomerate(items, distance, None)
-        ordered = sorted(heights)
+
+class AlphaClusterer:
+    """Движок α-кластеризации: тяжёлые матрицы считаются один раз.
+
+    Нужен там, где уровень α перебирается многократно (ползунок, анимация в
+    интерфейсе): матрица сходства считается при создании объекта, max-min
+    замыкание и трасса агломерации — лениво и однократно, а каждый следующий
+    вызов :meth:`clustering` при новом уровне стоит доли миллисекунды.
+
+    Параметры — те же, что у :func:`alpha_cut_clustering`.
+
+    Пример
+    ------
+    ::
+
+        engine = AlphaClusterer(sample, linkage="complete")
+        [len(engine.clustering(alpha).clusters) for alpha in (1.0, 0.8, 0.5)]
+        # [300, 9, 3]
+    """
+
+    def __init__(
+        self,
+        variables: Iterable[object],
+        *,
+        metric: str = "hausdorff",
+        linkage: str = "single",
+        closure: bool = True,
+        scale: Optional[float] = None,
+    ) -> None:
+        key = str(linkage).strip().lower()
+        if key not in {"single", "complete"}:
+            raise ValueError(
+                f"Неизвестный тип связи {linkage!r}. Доступны: single, complete"
+            )
+        self.metric = metric
+        self.linkage = key
+        self.closure = bool(closure)
+        self._items = _as_items(variables)
+        self._distance = get_distance_function(metric)
+        self._similarity, self.scale = _similarity_data(
+            self._items, self._distance, _validate_scale(scale)
+        )
+        self._closed: Optional[List[List[float]]] = None
+        self._trace: Optional[Agglomeration] = None
+
+    # ------------------------------------------------------------------
+    # Данные, посчитанные один раз
+    # ------------------------------------------------------------------
+    @property
+    def size(self) -> int:
+        """Число величин в выборке."""
+        return len(self._items)
+
+    @property
+    def similarity(self) -> List[List[float]]:
+        """Копия матрицы сходства ``r_ij = 1 - d_ij / d0``."""
+        return [list(row) for row in self._similarity]
+
+    @property
+    def closed(self) -> List[List[float]]:
+        """Max-min замыкание матрицы сходства (считается при первом обращении)."""
+        if self._closed is None:
+            self._closed = max_min_closure(self._similarity)
+        return self._closed
+
+    @property
+    def trace(self) -> Agglomeration:
+        """Трасса агломерации полной связи (считается при первом обращении)."""
+        if self._trace is None:
+            merges = (
+                _agglomerate(self._items, self._distance, None)[2]
+                if self._items
+                else []
+            )
+            self._trace = Agglomeration(len(self._items), tuple(merges))
+        return self._trace
+
+    # ------------------------------------------------------------------
+    # Результаты
+    # ------------------------------------------------------------------
+    def clustering(
+        self, alpha: float = 0.5, *, closure: Optional[bool] = None
+    ) -> ClusterResult:
+        """Кластеры при уровне ``alpha`` (как :func:`alpha_cut_clustering`)."""
+        level = _validate_alpha(alpha)
+        use_closure = self.closure if closure is None else bool(closure)
+        parameters: Dict[str, Any] = {
+            "alpha": level,
+            "linkage": self.linkage,
+            "closure": use_closure and self.linkage == "single",
+            "distance_scale": self.scale,
+        }
+        if not self._items:
+            return _build_result([], [], "alpha", self.metric, parameters)
+
+        if self.linkage == "complete":
+            # Сходство >= alpha  <=>  расстояние <= (1 - alpha) * d0.
+            groups = _group_by_labels(
+                self.trace.labels((1.0 - level) * self.scale)
+            )
+        else:
+            matrix = self.closed if use_closure else self._similarity
+            groups = _alpha_components(matrix, level)
+        return _build_result(self._items, groups, "alpha", self.metric, parameters)
+
+    def profile(
+        self,
+        alphas: Optional[Iterable[float]] = None,
+        *,
+        closure: Optional[bool] = None,
+    ) -> List[Dict[str, Any]]:
+        """Зависимость числа кластеров от уровня (как :func:`alpha_cut_profile`)."""
+        levels = [
+            _validate_alpha(level)
+            for level in (alphas if alphas is not None else DEFAULT_ALPHA_GRID)
+        ]
+        if not self._items:
+            return [{"alpha": level, "cluster_count": 0} for level in levels]
+
+        if self.linkage == "complete":
+            # Дендрограмма построена один раз, уровень — просто разрез по высоте.
+            ordered = sorted(self.trace.heights)
+            return [
+                {
+                    "alpha": level,
+                    "cluster_count": self.size
+                    - bisect.bisect_right(ordered, (1.0 - level) * self.scale),
+                }
+                for level in levels
+            ]
+
+        use_closure = self.closure if closure is None else bool(closure)
+        matrix = self.closed if use_closure else self._similarity
         return [
-            {
-                "alpha": level,
-                "cluster_count": len(items)
-                - bisect.bisect_right(ordered, (1.0 - level) * d0),
-            }
+            {"alpha": level, "cluster_count": len(_alpha_components(matrix, level))}
             for level in levels
         ]
-
-    if closure:
-        matrix = max_min_closure(matrix)
-    return [
-        {"alpha": level, "cluster_count": len(_alpha_components(matrix, level))}
-        for level in levels
-    ]
 
 
 # ----------------------------------------------------------------------
