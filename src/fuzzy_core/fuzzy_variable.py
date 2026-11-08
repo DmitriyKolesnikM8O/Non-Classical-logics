@@ -425,6 +425,9 @@ def get_distance_function(metric: str = "hausdorff") -> Callable[[object, object
 
 
 def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    """
+    ограничение числа заданным диапазоном
+    """
     return max(low, min(high, value))
 
 
@@ -442,12 +445,13 @@ def _probability_greater(a1: float, b1: float, a2: float, b2: float) -> float:
             return 1.0
         if a1 < a2:
             return 0.0
-        return 0.5
+        return 0.5 # точки совпадают
     if w1 <= 0.0:  # A — точка
         return _clamp((a1 - a2) / w2)
     if w2 <= 0.0:  # B — точка
         return _clamp((b1 - a2) / w1)
 
+    # отсекаем невозможные области и исключаем мнимые
     def positive(x: float) -> float:
         return x if x > 0.0 else 0.0
 

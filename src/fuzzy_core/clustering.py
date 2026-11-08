@@ -340,11 +340,15 @@ def _kmeans_plus_plus(
     centroids = [items[rng.randrange(size)]]
     closest = [distance(items[i], centroids[0]) for i in range(size)]
 
+    # выбираем k центроидов так, чтобы они были как можно дальше
     for _ in range(k - 1):
-        weights = [d * d for d in closest]
+        weights = [d * d for d in closest] # для каждой точки берем квадрат расстояния до ее ближайшего центра
         total = sum(weights)
         if total > 0.0:
-            target = rng.random() * total
+            # Через накопленную сумму (accumulated) выбирается точка $i$, чей сегмент накрыл target.
+            #  Точка выбирается случайно, но строго с вероятностью, пропорциональной квадрату 
+            # расстояния $P(x_i) = \frac{D(x_i)^2}{\sum D(x)^2}$.   
+            target = rng.random() * total # генерируем случайную отметку
             accumulated = 0.0
             index = size - 1
             for i, weight in enumerate(weights):
@@ -413,15 +417,25 @@ def kmeans(
 
     rng = random.Random(seed)
     centroids = _kmeans_plus_plus(items, k, distance, rng)
-    labels = [0] * size
+    labels = [0] * size #хранится принадлежность каждой из size величин кластеру.
 
     for _ in range(max_iter):
+
+        # Каждая нечеткая величина $v$ относится к кластеру, центроид которого centroids[c] 
+        # ближе всего по выбранной метрике. 
+
+        # Ключ (distance(v, centroids[c]), c) при равенстве расстояний относит точку к кластеру 
+        # с меньшим индексом $c$, гарантируя детерминированность разбиения.  
         labels = [
             min(range(k), key=lambda c: (distance(v, centroids[c]), c)) for v in items
         ]
 
         # Заполнение пустых кластеров: переносим самую удалённую точку
         # из кластера, где элементов больше одного.
+
+        # Если в процессе итерации какой-то кластер остался без элементов 
+        # (counts[cluster_index] == 0), алгоритм не теряет его, чтобы итоговое число кластеров не 
+        # стало меньше $k$.
         counts = [labels.count(c) for c in range(k)]
         for cluster_index in range(k):
             if counts[cluster_index] > 0:
@@ -438,6 +452,7 @@ def kmeans(
             labels[victim] = cluster_index
             counts[cluster_index] = 1
 
+        # Центроид каждого кластера обновляется как «средняя величина»
         new_centroids: List[UniformFuzzyVariable] = []
         for cluster_index in range(k):
             members = [items[i] for i in range(size) if labels[i] == cluster_index]
@@ -445,6 +460,9 @@ def kmeans(
                 _mean_variable(members) if members else centroids[cluster_index]
             )
 
+        # проверка сходимости: критерий останова
+        # shift — максимальное изменение границ $[a, b]$ среди всех центроидов между 
+        # текущей и предыдущей итерациями.
         shift = max(
             max(abs(new.a - old.a), abs(new.b - old.b))
             for new, old in zip(new_centroids, centroids)
@@ -516,9 +534,14 @@ class Agglomeration:
         return tuple(height for _, _, height in self.merges)
 
     def _labels_from(self, merges: Iterable[Tuple[int, int, float]]) -> List[int]:
-        """Метки кластеров после указанных слияний (общая часть ``labels*``)."""
+        """Метки кластеров после указанных слияний (общая часть ``labels*``).
+        Метки (labels) — это просто номера кластеров, которые алгоритм присваивает к
+        аждому объекту из выборки
+        """
         parent = list(range(self.size))
 
+        # Функция find находит корень (главного представителя) того кластера, 
+        # которому принадлежит элемент index.
         def find(index: int) -> int:
             while parent[index] != index:
                 parent[index] = parent[parent[index]]
