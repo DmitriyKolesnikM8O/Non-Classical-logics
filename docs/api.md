@@ -646,8 +646,8 @@ MembershipPlot(master, *, width=6.4, height=4.4, dpi=100, toolbar=True,
 
 Дополнительно: `distinct_colors(count)` — список различимых цветов (до 8 групп —
 фиксированная палитра `COLORS`, дальше цвета строятся по кругу оттенков с шагом
-«золотое сечение»); `membership_points(variable, pad=1.0)` — точки ломаной
-функции принадлежности; `NOISE_COLOR` — цвет шума.
+«золотое сечение»); `membership_points(variable)` — точки контура функции
+принадлежности (стороны прямоугольника, без нулевой линии вдоль оси x); `NOISE_COLOR` — цвет шума.
 
 ```python
 import tkinter as tk

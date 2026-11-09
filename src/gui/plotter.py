@@ -74,17 +74,24 @@ def distinct_colors(count: int) -> List[str]:
     ]
 
 
-def membership_points(variable: Any, pad: float = 1.0) -> Tuple[List[float], List[float]]:
-    """Точки ломаной μ(x) для равномерной величины: 0 → 1 на [a, b] → 0.
+def membership_points(variable: Any) -> Tuple[List[float], List[float]]:
+    """Точки контура μ(x) для равномерной величины: прямоугольник на [a, b].
 
-    Возвращает пару списков ``(x, y)``: слева от ``a`` и справа от ``b``
-    функция принадлежности равна нулю, внутри отрезка — единице.
+    Функция принадлежности равномерной величины — прямоугольник, поэтому
+    фронты должны быть вертикальными. Возвращаются только его стороны:
+    подъём в точке ``a``, плато и сброс в точке ``b``. Нулевая линия вдоль
+    оси абсцисс не рисуется — иначе она тянется далеко за пределы величины.
+
+    Вырожденная величина ``[a, a]`` даёт вертикальный импульс высотой 1,
+    а не треугольник.
+
+    Возвращает пару списков ``(x, y)``, пригодных для ``plot`` и ``fill``.
     """
     a = float(variable.a)
     b = float(variable.b)
-    left = a - abs(pad)
-    right = b + abs(pad)
-    return [left, a, b, right], [0.0, 1.0, 1.0, 0.0]
+    if a == b:
+        return [a, a], [0.0, 1.0]
+    return [a, a, b, b], [0.0, 1.0, 1.0, 0.0]
 
 
 class MembershipPlot(ttk.Frame):
@@ -183,9 +190,11 @@ class MembershipPlot(ttk.Frame):
         """Нарисовать функции принадлежности набора величин.
 
         ``labels`` — подписи для легенды; при нехватке подписей используется
-        запись вида ``[a; b]``. Если кривых больше ``max_legend_items``,
-        легенда не рисуется (она перекрыла бы график) — вместо неё выводится
-        короткая пометка.
+        запись вида ``[a; b]``. ``pad`` — поля по оси x слева и справа от
+        крайних границ (в тех же единицах, что и ``x``): сами кривые нулевой
+        линии не рисуют, отступ нужен только для «воздуха» вокруг графика.
+        Если кривых больше ``max_legend_items``, легенда не рисуется (она
+        перекрыла бы график) — вместо неё выводится короткая пометка.
         """
         items = list(variables)
         captions = list(labels) if labels is not None else []
@@ -193,9 +202,9 @@ class MembershipPlot(ttk.Frame):
 
         for index, variable in enumerate(items):
             color = COLORS[index % len(COLORS)]
-            xs, ys = membership_points(variable, pad)
+            xs, ys = membership_points(variable)
             caption = captions[index] if index < len(captions) else f"[{variable.a:g}; {variable.b:g}]"
-            self.axes.fill(xs, ys, color=color, alpha=0.15)
+            self.axes.fill(xs, ys, color=color, alpha=0.15, edgecolor="none")
             self.axes.plot(xs, ys, color=color, linewidth=2.0, label=caption)
             if show_center:
                 self.axes.vlines(
@@ -211,6 +220,10 @@ class MembershipPlot(ttk.Frame):
             self._labels.append(caption)
 
         if items:
+            margin = abs(float(pad))
+            xs_all = [x for xs, _ in self._curves for x in xs]
+            if xs_all:
+                self.axes.set_xlim(min(xs_all) - margin, max(xs_all) + margin)
             if len(self._labels) <= max_legend_items:
                 self.axes.legend(loc="upper right", fontsize=8)
             else:

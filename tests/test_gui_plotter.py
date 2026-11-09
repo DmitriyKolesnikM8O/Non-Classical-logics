@@ -51,24 +51,27 @@ def test_distinct_colors_are_pale_enough_for_white_background():
 # ----------------------------------------------------------------------
 # Точки функции принадлежности
 # ----------------------------------------------------------------------
-def test_membership_points_form_trapezoid():
+def test_membership_points_form_rectangle():
     variable = UniformFuzzyVariable(2.0, 5.0)
-    xs, ys = membership_points(variable, pad=1.0)
-    assert xs == [1.0, 2.0, 5.0, 6.0]
+    xs, ys = membership_points(variable)
+    # Только контур: вертикальный подъём, плато и вертикальный сброс.
+    # Нулевых «хвостов» вдоль оси x нет.
+    assert xs == [2.0, 2.0, 5.0, 5.0]
     assert ys == [0.0, 1.0, 1.0, 0.0]
 
 
 def test_membership_points_negative_interval():
     variable = UniformFuzzyVariable(-3.0, -1.0)
-    xs, ys = membership_points(variable, pad=0.5)
-    assert xs == [-3.5, -3.0, -1.0, -0.5]
+    xs, ys = membership_points(variable)
+    assert xs == [-3.0, -3.0, -1.0, -1.0]
     assert ys == [0.0, 1.0, 1.0, 0.0]
 
 
 def test_membership_points_crisp_variable():
     xs, ys = membership_points(UniformFuzzyVariable(1.0, 1.0))
-    assert xs == [0.0, 1.0, 1.0, 2.0]
-    assert ys == [0.0, 1.0, 1.0, 0.0]
+    # Вырожденная величина — вертикальный импульс, а не треугольник.
+    assert xs == [1.0, 1.0]
+    assert ys == [0.0, 1.0]
 
 
 # ----------------------------------------------------------------------
@@ -119,8 +122,28 @@ def test_curve_points_match_membership(tk_window):
     variable = UniformFuzzyVariable(2.0, 5.0)
     plot.show_variables([variable])
     xs, ys = plot.curve_points(0)
-    assert xs == [1.0, 2.0, 5.0, 6.0]
+    assert xs == [2.0, 2.0, 5.0, 5.0]
     assert ys == [0.0, 1.0, 1.0, 0.0]
+
+
+def test_show_variables_pads_x_axis_without_drawing_zero_line(tk_window):
+    plot = MembershipPlot(tk_window)
+    plot.show_variables([UniformFuzzyVariable(1, 3)], pad=1.0)
+
+    # Отступ по оси x остался, но нулевой линии вдоль оси больше нет.
+    assert plot.x_limits == (0.0, 4.0)
+    xs, ys = plot.curve_points(0)
+    assert xs == [1.0, 1.0, 3.0, 3.0]
+    assert min(ys) == 0.0 and max(ys) == 1.0
+
+
+def test_crisp_variable_is_vertical_impulse(tk_window):
+    plot = MembershipPlot(tk_window)
+    plot.show_variables([UniformFuzzyVariable(0, 0)], pad=1.0)
+    xs, ys = plot.curve_points(0)
+    assert xs == [0.0, 0.0]
+    assert ys == [0.0, 1.0]
+    assert plot.x_limits == (-1.0, 1.0)
 
 
 def test_x_limits_cover_the_variables(tk_window):
